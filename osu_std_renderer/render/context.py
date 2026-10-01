@@ -19,7 +19,7 @@ def create_context() -> "moderngl.Context":
     ignores CUDA_VISIBLE_DEVICES, so the device must be selected explicitly.
     """
     import sys
-    if sys.platform == "win32":
+    if sys.platform in ("win32", "darwin"):
         # Windows contributors: glcontext ships no EGL backend; use the default
         # WGL standalone context. R3D_EGL_DEVICE_INDEX is EGL-only (Linux).
         return moderngl.create_context(standalone=True)
