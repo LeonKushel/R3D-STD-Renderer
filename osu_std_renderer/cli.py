@@ -1352,15 +1352,28 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         print("WARNING: no audio mixed — rendering SILENT video",
               file=sys.stderr)
 
+    total_wall_ms = m2w(end_ms)
+    # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
+    # that encodes the master also write the lean 720p30 preview embed as a
+    # second output, so it is finished the moment the render is. Without it the
+    # node re-encodes the finished master afterwards before anything can be
+    # published. Single renders only (merge.py builds its own command).
+    preview_path = None
+    if os.environ.get("R3D_PREVIEW_INLINE") == "1":
+        preview_path = output.parent / (output.stem + ".embed.mp4")
+        print(f"[std] inline preview -> {preview_path.name}",
+              file=sys.stderr, flush=True)
     encoder = probe_encoder(settings.encoder)
     cmd = build_ffmpeg_cmd(
         encoder=encoder, resolution=(w, h), fps=settings.fps,
         output_path=output, audio_path=audio_path,
         audio_offset_ms=settings.audio_offset, loudnorm=False,
         video_bitrate=settings.video_bitrate,
-        encoder_device=settings.encoder_device)
+        encoder_device=settings.encoder_device,
+        preview_path=preview_path,
+        total_dur_s=(total_wall_ms / 1000.0 if preview_path is not None
+                     else None))
 
-    total_wall_ms = m2w(end_ms)
     last_pct = [-1]
 
     def progress(frac: float) -> None:
