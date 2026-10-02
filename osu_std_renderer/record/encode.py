@@ -16,6 +16,7 @@ Differences from the reference (§5.6) — deliberate:
 """
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import subprocess
@@ -64,13 +65,33 @@ def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     return int(min(16_000_000.0, max(2_500_000.0, target)))
 
 
+def preview_video_bps(total_dur_s: "float | None") -> int:
+    """Video bitrate of the lean preview embed. Mirrors the contributor
+    client's makeEmbedVariant (and the bot's _transcode_embed_unbounded):
+    ~1.4 Mbps, lowered on long maps so the file stays <= ~24 MiB, floor 500k.
+    Same formula as the catch engine's inline preview."""
+    vbps = 1_400_000
+    if total_dur_s and total_dur_s > 0:
+        vbps = int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000
+        vbps = max(500_000, min(1_400_000, vbps))
+    return vbps
+
+
 def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      output_path: Path, audio_path: Path | None = None,
                      audio_offset_ms: int = 0, video_bitrate: int | None = None,
                      crf: int = 16, audio_bitrate: str = "192k",
                      loudnorm: bool = True, extra_vf: str = "",
-                     encoder_device: str | None = None) -> list[str]:
-    """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape)."""
+                     encoder_device: str | None = None,
+                     preview_path: Path | None = None,
+                     total_dur_s: float | None = None) -> list[str]:
+    """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape).
+
+    `preview_path` (INLINE PREVIEW, R3D_PREVIEW_INLINE=1 in the CLI; default
+    None) makes the SAME ffmpeg process also write a lean 720p30 libx264
+    preview embed as a second output. With it None the command is built
+    exactly as before. `total_dur_s` (video length, if known) only sizes the
+    preview's bitrate."""
     w, h = resolution
     is_vaapi = encoder == "h264_vaapi"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -92,36 +113,41 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     # the GL readback buffer to the pipe zero-copy instead of paying a
     # ~6 MB negative-stride flip copy per frame — see FfmpegPipe._writer.
     _vf = "vflip" + ("," + extra_vf if extra_vf else "")
-    if is_vaapi:
-        _vf += ",format=nv12,hwupload"
-    cmd += ["-vf", _vf]
-    cmd += ["-c:v", encoder]
+    # master-only tail of the video chain (VAAPI surface upload). Kept apart
+    # from `_vf` so the inline-preview graph can apply it on the master
+    # branch only; without a preview it is appended to `-vf` as before.
+    _vm_tail = "format=nv12,hwupload" if is_vaapi else ""
+    # video codec args are collected in `vc` (appended below) so the
+    # two-output preview command can place them after its own -map.
+    vc: list[str] = ["-c:v", encoder]
     if encoder == "libx264":
         if video_bitrate:
             _vb = int(video_bitrate)
-            cmd += ["-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
+            vc += ["-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
                     "-bufsize", str(_vb * 2), "-preset", "faster", "-profile:v", "high"]
         else:
-            cmd += ["-crf", str(crf), "-preset", "faster", "-profile:v", "high"]
+            vc += ["-crf", str(crf), "-preset", "faster", "-profile:v", "high"]
     elif encoder in ("h264_nvenc", "hevc_nvenc"):
         # Resolution-scaled NVENC bitrate ladder (R3D cross-engine policy,
         # 2026-07): replaces the 2026-07-21 CQ scheme (cq=crf+4, -b:v 0,
         # maxrate (w*h)/150k) with the shared target-VBR ladder so all four
         # engines land on the same size/quality curve -- see nvenc_target_bps.
         _tgt = video_bitrate or nvenc_target_bps(w, h, fps)
-        cmd += ["-rc", "vbr", "-b:v", str(_tgt),
+        vc += ["-rc", "vbr", "-b:v", str(_tgt),
                 "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2),
                 "-profile:v", "high"]
     elif is_vaapi:
         _vb = video_bitrate or nvenc_target_bps(w, h, fps)
-        cmd += ["-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
+        vc += ["-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
                 "-bufsize", str(_vb * 2)]
     elif video_bitrate:
-        cmd += ["-b:v", str(video_bitrate)]
+        vc += ["-b:v", str(video_bitrate)]
     if not is_vaapi:
         # VAAPI output pixel format is set by the hwupload filtergraph (nv12 on a
         # GPU surface); forcing -pix_fmt yuv420p here conflicts with the encoder.
-        cmd += ["-pix_fmt", "yuv420p"]
+        vc += ["-pix_fmt", "yuv420p"]
+    af: list[str] = []
+    acodec: list[str] = []
     if audio_path is not None:
         # LOUDNORM DUCK FIX (#17): when the music was pre-normalised upstream
         # (loudnorm=False), do NOT loudnorm the mixed song+hits (that ducked the
@@ -129,12 +155,64 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # summed peaks without ducking.
         af = ([LOUDNORM] if loudnorm
               else ["alimiter=limit=0.95:level=disabled:attack=1:release=20"])
-        if af:
-            cmd += ["-af", ",".join(af)]
-        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000", "-shortest"]
-    cmd += ["-movflags", "+faststart", str(output_path)]
-    return cmd
+        acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
+                  "-shortest"]
+    if preview_path is None:
+        cmd += ["-vf", _vf + ("," + _vm_tail if _vm_tail else "")]
+        cmd += vc
+        if audio_path is not None:
+            if af:
+                cmd += ["-af", ",".join(af)]
+            cmd += acodec
+        cmd += ["-movflags", "+faststart", str(output_path)]
+        return cmd
 
+    # TWO OUTPUTS FROM ONE PROCESS (inline preview). The frame pipe is read
+    # once. The master's own video chain (`vflip` + extra_vf — frames arrive
+    # BOTTOM-UP) runs BEFORE `split`, so both outputs are the right way up and
+    # the master sees the same frames as with `-vf`; `split` then hands them
+    # to the master encoder (unchanged settings; the VAAPI upload stays on
+    # the master branch only) and to a 720p30 libx264 preview. Audio: the
+    # master's own `-af` chain stays on the shared branch, then `asplit`; the
+    # preview branch gets the loudness pass the contributor client would
+    # otherwise apply before cutting its embed, so the preview needs no
+    # post-processing at all.
+    pfps = min(30, int(round(float(fps))))
+    graph = [f"[0:v]{_vf},split=2[vm0][vp0];[vm0]{_vm_tail or 'null'}[vm];"
+             f"[vp0]scale=-2:720,fps={pfps}[vp]"]
+    if audio_path is not None:
+        # the audio file is input 1 (input 0 is the rawvideo pipe).
+        # `aformat=sample_rates=48000` PINS the shared branch to the master's
+        # own output rate (its `-ar 48000`; the mixed wav is 48 kHz too, so
+        # this converts nothing). Without it the preview's loudnorm — which
+        # runs at 192 kHz internally — wins format negotiation back through
+        # `asplit`, the master's limiter then runs at 192 kHz and the master
+        # audio is resampled 48k→192k→48k: measurably NOT the bytes the
+        # `-af` path produces (ffmpeg 8.1). Pinned, the 192 kHz conversion
+        # sits on the preview branch only and the master is byte-identical.
+        graph.append(f"[1:a]{','.join(af) or 'anull'},"
+                     f"aformat=sample_rates=48000[aout]")
+        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
+    cmd += ["-filter_complex", ";".join(graph)]
+    # output 1: the master, exactly as without the preview
+    cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio_path is not None
+                               else [])
+    cmd += vc + acodec
+    cmd += ["-movflags", "+faststart", str(output_path)]
+    # output 2: the preview. libx264 on every node, deliberately: a second
+    # NVENC/VAAPI session can fail to open (session limits), and one failed
+    # output kills the whole process and with it the render.
+    vbps = preview_video_bps(total_dur_s)
+    cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if audio_path is not None
+                               else [])
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+            "-bufsize", str(vbps * 2), "-g", "30",
+            "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+    if audio_path is not None:
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
+    cmd += ["-movflags", "+faststart", str(preview_path)]
+    return cmd
 
 class FfmpegPipe:
     """Spawn ffmpeg, push raw frames, close. Mirrors mania v2's FfmpegPipe
