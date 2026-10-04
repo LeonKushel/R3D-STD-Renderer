@@ -25,6 +25,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -56,8 +57,64 @@ def _loudnorm_cache_disabled() -> bool:
         not in ("", "0", "false", "no", "off")
 
 
-def _loudnorm_cache_dir() -> Path:
-    return Path(os.environ.get("R3D_LOUDNORM_CACHE_DIR", _DEFAULT_CACHE_DIR))
+# Resolved ONCE per process: [Path] when a location is usable, [None] when none is.
+_CACHE_DIR_RESOLVED: list = []
+
+
+def _platform_cache_dir() -> Path:
+    """Per-user fallback for boxes without the shared /data mount."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "r3d" / "loudnorm-cache"
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "r3d" / "loudnorm-cache"
+
+
+def _cache_dir_usable(d: Path) -> bool:
+    """Can we actually create AND write here? mkdir alone is not enough -- a
+    read-only mount passes mkdir(exist_ok=True) and fails at write time."""
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".probe-")
+        os.close(fd)
+        os.unlink(tmp)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _loudnorm_cache_dir() -> "Path | None":
+    """Where to keep cached loudnorm PCM, or None if nowhere is writable.
+
+    `/data/r3d/loudnorm-cache` stays the PREFERRED location -- that is what the
+    production Linux boxes mount, and keeping it first means their behaviour is
+    unchanged. The per-user fallback exists because a Mac render node cannot
+    create `/data` without root, and the old code swallowed that OSError: the
+    cache was silently off on EVERY render, costing **9.1% of total process
+    wall** (14.91 s -> 13.55 s measured) while `fps` showed nothing, because the
+    decode wait happens before the t0 that fps is measured from.
+
+    An explicit R3D_LOUDNORM_CACHE_DIR is honoured as-is, with no fallback: if
+    an operator names a directory, silently using a different one is worse than
+    saying it does not work.
+    """
+    if _CACHE_DIR_RESOLVED:
+        return _CACHE_DIR_RESOLVED[0]
+    env = os.environ.get("R3D_LOUDNORM_CACHE_DIR", "").strip()
+    cands = [Path(env)] if env else [Path(_DEFAULT_CACHE_DIR),
+                                     _platform_cache_dir()]
+    for i, d in enumerate(cands):
+        if _cache_dir_usable(d):
+            if i:
+                print(f"loudnorm cache: {cands[0]} not writable, using {d}",
+                      file=sys.stderr)
+            _CACHE_DIR_RESOLVED.append(d)
+            return d
+    print("loudnorm cache: NO writable location (tried "
+          + ", ".join(str(c) for c in cands)
+          + ") - the loudnorm pass will re-run on every render",
+          file=sys.stderr)
+    _CACHE_DIR_RESOLVED.append(None)
+    return None
 
 
 def _loudnorm_cache_key(path: Path, rate: float, pitch: bool,
@@ -170,8 +227,11 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
     cache_path = None
     if loudnorm and not _loudnorm_cache_disabled():
         try:
-            key = _loudnorm_cache_key(Path(path), rate, pitch, _LOUDNORM_FILTER)
-            cache_path = _loudnorm_cache_dir() / f"{key}.{_CACHE_EXT}"
+            _cdir = _loudnorm_cache_dir()
+            if _cdir is not None:
+                key = _loudnorm_cache_key(Path(path), rate, pitch,
+                                          _LOUDNORM_FILTER)
+                cache_path = _cdir / f"{key}.{_CACHE_EXT}"
         except OSError:
             cache_path = None  # can't hash the source -> just decode uncached
         if cache_path is not None:

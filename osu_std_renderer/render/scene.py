@@ -160,7 +160,7 @@ from .effects import (LOGO_UI_SIZE, SMOKE_DEFAULT_WIDTH_OSU,
                       rainbow_rgb, ripple_events, ripple_states,
                       seizure_alpha, smoke_point_alpha, smoke_segments,
                       triangle_field, triangle_states, warning_arrow_alpha)
-from .gl import Sprite
+from .gl import _GPU_YUV, Sprite
 from .hud import layout_run
 from .mods import (HIDDEN_FADE_IN_MULT, MOD_FLASHLIGHT, MOD_HIDDEN,
                    build_flashlight_timeline, flashlight_size_at,
@@ -174,6 +174,31 @@ from .transform_mods import (DEFLATE, GROW, HIDES_APPROACH, IDENTITY, SPIN_IN,
 from .appearance_mods import (approach_different_scale, freeze_frame_scale,
                               freeze_preempts)
 from . import perf
+
+# MEASUREMENT ONLY, never ship on: ceiling for moving the SSAA outro's LANCZOS
+# downscale off the render thread (replaces it with NEAREST - wrong pixels).
+_ABL_SSAA_NEAREST = perf.envflag("R3D_STD_ABL_SSAA_NEAREST")
+# R3D_STD_SSAA_ASYNC: below 1080p the results outro is supersampled and every
+# frame is LANCZOS-downscaled on the CPU (~23 ms at 1080->720), which made a
+# 720p render slower than a 1080p one. With this on, the record loop hands the
+# hi-res frame to a small thread pool and pushes a FUTURE; the ffmpeg writer
+# resolves futures in FIFO order, so the byte stream is unchanged. PIL's resize
+# releases the GIL, so the pool really runs beside the render thread.
+_SSAA_ASYNC = perf.envflag("R3D_STD_SSAA_ASYNC")
+_SSAA_WORKERS = 4
+
+
+def _ssaa_downscale(hi, ow: int, oh: int, yuv: bool):
+    """Pool job: the exact downscale _frame_rgb_ssaa does in line. `yuv` also
+    converts with the CPU twin of the GPU-YUV shader (bit-identical to it), in
+    the GL bottom-up row order the planar stream uses."""
+    from PIL import Image
+    out = np.asarray(Image.fromarray(hi).resize((ow, oh), Image.LANCZOS),
+                     dtype=np.uint8)
+    if yuv:
+        from .gl import rgb_to_yuv420p
+        return rgb_to_yuv420p(out[::-1])
+    return out
 from . import screen_mods as _sm
 from . import repel_magnet as _rm
 from .repel_magnet import MAGNETISED, REPEL
@@ -1951,7 +1976,8 @@ class StdScene:
                 and t >= self.results_start_ms:
             # Red's shared results card (render/results.py) — dims the
             # whole scene (HUD included, the mania draw order) under it
-            self.results.draw(t - self.results_start_ms)
+            with perf.T("results_draw"), perf.P("results"):
+                self.results.draw(t - self.results_start_ms)
         if self.logo_start_ms is not None:
             self._draw_logo(t)        # intro splash over the idle scene
         if self.seizure_start_ms is not None:
@@ -2039,7 +2065,8 @@ class StdScene:
         if not skip_results and self.results is not None \
                 and self.results_start_ms is not None \
                 and t >= self.results_start_ms:
-            self.results.draw(t - self.results_start_ms)
+            with perf.T("results_draw"):
+                self.results.draw(t - self.results_start_ms)
 
     @staticmethod
     def _fail_sprite_xform(pivot, center, o_scale, o_rot, fall_px,
@@ -2066,15 +2093,32 @@ class StdScene:
         if self.results_ssaa is not None and self.results is not None \
                 and self.results_start_ms is not None \
                 and t >= self.results_start_ms:
+            # Drain FIRST, then queue this frame: the drain emits what the ring
+            # already holds (oldest first) and the frame queued here comes out on
+            # the next call, or in frame_rgb_drain() for the last one. Every frame
+            # is emitted exactly once, in order.
+            if _SSAA_ASYNC:
+                out = (self.spr.read_yuv_drain() if _GPU_YUV
+                       else self.spr.read_drain())
+                out.append(self._frame_rgb_ssaa(t, defer=True))
+                return out
+            if _GPU_YUV:
+                out = self.spr.read_yuv_drain()
+                q = self.spr.yuv_from_rgb(self._frame_rgb_ssaa(t))
+                if q is not None:
+                    out.append(q)
+                return out
             out = self.spr.read_drain()
             out.append(self._frame_rgb_ssaa(t))
             return out
         self.render_frame(t)
-        fr = self.spr.read_rgb_async()
+        fr = (self.spr.read_yuv_async() if _GPU_YUV
+              else self.spr.read_rgb_async())
         return [fr] if fr is not None else []
 
     def frame_rgb_drain(self) -> list:
-        return self.spr.read_drain()
+        return (self.spr.read_yuv_drain() if _GPU_YUV
+                else self.spr.read_drain())
 
     def frame_rgb(self, t: float):
         if self.results_ssaa is not None and self.results is not None \
@@ -2084,7 +2128,7 @@ class StdScene:
         self.render_frame(t)
         return self.spr.read_rgb()
 
-    def _frame_rgb_ssaa(self, t: float):
+    def _frame_rgb_ssaa(self, t: float, defer: bool = False):
         """SSAA the results outro: render the scene-behind at OUTPUT res,
         composite the results card on top at the internal supersample res
         (self.results_ssaa's size), then downscale the whole frame back to
@@ -2106,26 +2150,50 @@ class StdScene:
         iw, ih = spr_hi.width, spr_hi.height
 
         # 1) scene-behind (no card) at output res
-        self.render_frame(t, skip_results=True)
-        base = self.spr.read_rgb()                       # (oh, ow, 3)
+        with perf.T("ssaa_base"):
+            self.render_frame(t, skip_results=True)
+            base = self.spr.read_rgb()                   # (oh, ow, 3)
 
         # 2) supersampled composite: blit the output-res base up as the
         #    backdrop (GPU LINEAR stretch — it sits under the card's dim
         #    wash / behind a fully-faded scene, so a mip chain is waste),
         #    then draw the card on top at the internal res
-        spr_hi.begin(clear=(0.0, 0.0, 0.0))
-        spr_hi.upload_texture("_ssaa_base", base, mipmaps=False)
-        spr_hi.draw([Sprite(iw / 2.0, ih / 2.0, float(iw), float(ih),
-                            "_ssaa_base", (1.0, 1.0, 1.0, 1.0))])
-        self.results.draw(t - self.results_start_ms)     # into spr_hi
-        hi = spr_hi.read_rgb()                            # (ih, iw, 3)
+        with perf.T("ssaa_card"):
+            spr_hi.begin(clear=(0.0, 0.0, 0.0))
+            if _SSAA_ASYNC:
+                # same texels, same LINEAR no-mip sampling - but written in
+                # place as RGB instead of widening to RGBA and allocating a
+                # new texture per outro frame
+                spr_hi.write_texture_rgb("_ssaa_base", base)
+            else:
+                spr_hi.upload_texture("_ssaa_base", base, mipmaps=False)
+            spr_hi.draw([Sprite(iw / 2.0, ih / 2.0, float(iw), float(ih),
+                                "_ssaa_base", (1.0, 1.0, 1.0, 1.0))])
+            with perf.T("results_draw"):
+                self.results.draw(t - self.results_start_ms)  # into spr_hi
+        with perf.T("ssaa_read_hi"):
+            hi = spr_hi.read_rgb()                        # (ih, iw, 3)
 
         # 3) downscale the supersampled frame to the output resolution
         if (iw, ih) == (ow, oh):
             return hi
-        return np.asarray(
-            Image.fromarray(hi).resize((ow, oh), Image.LANCZOS),
-            dtype=np.uint8)
+        if defer:
+            # record loop only: a Future the ffmpeg writer resolves in order
+            pool = getattr(self, "_ssaa_pool", None)
+            if pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                pool = self._ssaa_pool = ThreadPoolExecutor(
+                    max_workers=_SSAA_WORKERS,
+                    thread_name_prefix="ssaa-downscale")
+            return pool.submit(_ssaa_downscale, hi, ow, oh, _GPU_YUV)
+        with perf.T("ssaa_lanczos"):
+            if _ABL_SSAA_NEAREST:      # MEASUREMENT ONLY - wrong pixels
+                return np.asarray(
+                    Image.fromarray(hi).resize((ow, oh), Image.NEAREST),
+                    dtype=np.uint8)
+            return np.asarray(
+                Image.fromarray(hi).resize((ow, oh), Image.LANCZOS),
+                dtype=np.uint8)
 
     # --- background / effect layers (settings-surface phase) ---------------------
 
