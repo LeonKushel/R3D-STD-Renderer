@@ -1400,12 +1400,23 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # applied, so the contributor client can upload it WHILE it renders. The
     # marker file tells the client this engine honoured the flag; without it
     # the client keeps its post-render loudness pass.
+    # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1, default OFF; needs the inline
+    # preview): a third output encoded to the compact plan the node/bot use
+    # for `-embed-sm.mp4`, so nothing is left to encode after the render.
+    compact_path = None
+    from .record.encode import compact_wanted
+    if preview_path is not None and compact_wanted(
+            total_wall_ms / 1000.0, w, h, settings.fps, 1.0):
+        compact_path = output.parent / (output.stem + ".embed-sm.mp4")
+        print(f"[std] inline discord copy -> {compact_path.name}",
+              file=sys.stderr, flush=True)
     stream_master = os.environ.get("R3D_STREAM_MASTER") == "1"
     if stream_master:
         import json as _json
         (output.parent / (output.stem + ".stream.json")).write_text(_json.dumps(
             {"schema": 1, "faststart": False,
-             "loudnorm": "loudnorm=I=-18:TP=-1.5:LRA=11"}))
+             "loudnorm": "loudnorm=I=-18:TP=-1.5:LRA=11",
+             "compact": compact_path is not None}))
         print("[std] streamable master (no faststart, loudnorm in-engine)",
               file=sys.stderr, flush=True)
     perf.mark("aud:encoder_spawn")
@@ -1420,7 +1431,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         total_dur_s=(total_wall_ms / 1000.0 if preview_path is not None
                      else None),
         pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24",
-        stream_master=stream_master)
+        stream_master=stream_master,
+        compact_path=compact_path)
 
     last_pct = [-1]
 
