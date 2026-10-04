@@ -66,11 +66,13 @@ HONEST DEVIATIONS (documented, owner-visible):
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 from dataclasses import dataclass
 
 from PIL import Image, ImageDraw
 
+from . import perf
 from .gl import Sprite
 from .hud import BAND_50, BAND_100, BAND_300, build_mod_pills
 from .results import histogram_bins, mods_string
@@ -1255,6 +1257,23 @@ class LazerResultsScreen:
         self._arc_key = None
         self._arc_bucket = -1.0
         self._score_val = -1
+        # Memo for the per-frame ROLL bakes (score / stat values / accuracy
+        # arc). Every one is a pure function of its arguments, so a memo hit
+        # is byte-identical to baking in place. None = bake in place, exactly
+        # as before. Filled ahead of time by prebake_ahead() (off-thread).
+        self._memo: dict | None = None
+        self._ahead = None
+        _abl = os.environ.get("R3D_STD_ABL_RESMEMO")   # MEASUREMENT ONLY
+        if _abl:
+            import atexit
+            import pickle
+            self._memo = {}
+            if os.path.exists(_abl):
+                with open(_abl, "rb") as _fh:
+                    self._memo = pickle.load(_fh)
+            else:
+                atexit.register(lambda: pickle.dump(
+                    self._memo, open(_abl, "wb")))
         self.acc_frac = _clamp01(data.acc_pct / 100.0)
         # centre grade letter matches the ForRank ring (AccuracyCircle uses
         # the rank colour for the badge too)
@@ -1633,9 +1652,117 @@ class LazerResultsScreen:
         return (self._text(label, STAT_LABEL_VPX, (0.6, 0.63, 0.73)),
                 self._text(value, STAT_VALUE_VPX, color))
 
+    def _text_m(self, tag: str, text: str, px: int, color, loader):
+        """bake_text through the roll memo (see __init__). `tag` names the
+        loader, which is not hashable-by-value."""
+        m = self._memo
+        if m is None:
+            return bake_text(text, px, color, loader)
+        key = (tag, text, px, tuple(color))
+        r = m.get(key)
+        if r is None:
+            perf.count("results_memo_miss")
+            r = m[key] = bake_text(text, px, color, loader)
+        else:
+            perf.count("results_memo_hit")
+        return r
+
+    def _arc_m(self, px: int, prog: float):
+        m = self._memo
+        if m is None:
+            return bake_accuracy_arc(px, prog, self.grade_rgb)
+        key = ("arc", px, prog)
+        r = m.get(key)
+        if r is None:
+            perf.count("results_memo_miss")
+            r = m[key] = bake_accuracy_arc(px, prog, self.grade_rgb)
+        else:
+            perf.count("results_memo_hit")
+        return r
+
+    def prebake_ahead(self, ages) -> None:
+        """Bake the roll textures for the outro's frames on a worker thread,
+        while gameplay is still rendering (R3D_STD_RESULTS_AHEAD).
+
+        `ages` = the draw() arguments the record loop WILL pass, in order (an
+        iterable; consumed on the worker). The roll is a pure function of age,
+        so the worker computes the same (text / arc progress) keys the render
+        thread will ask for and fills the memo; draw() then finds them. A
+        wrong or late prediction is only a memo MISS - the render thread bakes
+        in place exactly as before - so output cannot depend on this thread.
+        No GL here: uploads stay on the render thread."""
+        import threading
+        if self._memo is None:
+            self._memo = {}
+        self._ahead = threading.Thread(
+            target=self._prebake_run, args=(ages,), name="results-prebake",
+            daemon=True)
+        self._ahead.start()
+
+    def _prebake_run(self, ages) -> None:
+        try:
+            jobs = self._prebake_jobs(ages)
+            m = self._memo
+            # Newest-first: if the render thread reaches the outro before this
+            # finishes it walks forward from the start, so the two meet in the
+            # middle instead of both baking the same frames.
+            for key, fn in reversed(jobs):
+                if key not in m:
+                    m[key] = fn()
+        except Exception:  # noqa: BLE001 - a miss is always safe
+            pass
+
+    def _prebake_jobs(self, ages) -> list:
+        """(memo key, bake thunk) for every roll bake draw() would do over
+        `ages`. Mirrors _draw_acc_arc / _roll_score / _roll_stats - including
+        their bake-only-on-change state - so the keys match exactly."""
+        k = self.k
+        arc_px = int(self.ACC_DISP * k)
+        vpx = int(STAT_VALUE_VPX * k)
+        spx = int(64 * k)
+        arc_bucket, score_val, rolled = -1.0, -1, False
+        jobs: list = []
+        seen: set = set()
+
+        def text(tag, s_, px, color, loader):
+            key = (tag, s_, px, tuple(color))
+            if key not in seen:
+                seen.add(key)
+                jobs.append((key, lambda: bake_text(s_, px, color, loader)))
+
+        for age in ages:
+            age_ms = age / self.speed
+            if age_ms <= 0.0:
+                continue
+            sweep = self._sweep(age_ms)
+            prog = self.target_arc * sweep
+            bucket = round(prog, 3)
+            if bucket != arc_bucket:
+                key = ("arc", arc_px, prog)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append((key, lambda p=prog: bake_accuracy_arc(
+                        arc_px, p, self.grade_rgb)))
+                arc_bucket = bucket
+            val = int(round(self.d.score * sweep))
+            if val != score_val:
+                text("score", f"{val:,}", spx, (1, 1, 1), self._score_loader)
+                score_val = val
+            if self._roll_cells and not rolled:
+                done = age_ms >= SWEEP_DELAY_MS + STAT_ROLL_MS
+                p = ease_out_quad((age_ms - SWEEP_DELAY_MS) / STAT_ROLL_MS) \
+                    if age_ms > SWEEP_DELAY_MS else 0.0
+                for _gi, target, fmt, color, na in self._roll_cells:
+                    if na:
+                        continue
+                    text("stat", fmt(target if done else target * p), vpx,
+                         color, self._font_loader)
+                rolled = done
+        return jobs
+
     def _score_text(self, value: int):
-        rgba, w, h = bake_text(f"{value:,}", int(64 * self.k), (1, 1, 1),
-                               self._score_loader)
+        rgba, w, h = self._text_m("score", f"{value:,}", int(64 * self.k),
+                                  (1, 1, 1), self._score_loader)
         if self._score_val < 0:
             self._score_key = self._put(rgba)
         else:
@@ -1817,8 +1944,7 @@ class LazerResultsScreen:
         prog = self.target_arc * self._sweep(age_ms)
         bucket = round(prog, 3)
         if bucket != self._arc_bucket:
-            rgba = bake_accuracy_arc(int(self.ACC_DISP * self.k), prog,
-                                     self.grade_rgb)
+            rgba = self._arc_m(int(self.ACC_DISP * self.k), prog)
             if self._arc_key is None:
                 self._arc_key = self._put(rgba)
             else:
@@ -1885,7 +2011,8 @@ class LazerResultsScreen:
             if na:
                 continue
             cur = target if done else target * p
-            rgba, w, h = bake_text(fmt(cur), vpx, color, self._font_loader)
+            rgba, w, h = self._text_m("stat", fmt(cur), vpx, color,
+                                      self._font_loader)
             vkey = self._grid_a[gi][1][0]
             self.spr.upload_texture(vkey, rgba)
             self._grid_a[gi] = (self._grid_a[gi][0],

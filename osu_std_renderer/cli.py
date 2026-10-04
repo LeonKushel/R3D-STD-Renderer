@@ -99,6 +99,7 @@ import time
 from pathlib import Path
 
 from .beatmap import load_full
+from .render import perf
 from .beatmap.difficulty import HIT_FADE_OUT
 from .beatmap.objects import Slider, Spinner
 from .replay import (KEY_SMOKE, is_relax_meta, parse_replay,
@@ -629,6 +630,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                                     cover_size, load_background)
     from .render.bloom import BloomPass
     from .render.effects import SEIZURE_DURATION_S
+    from .render import gl as gl_mod
     from .render.gl import SpriteRenderer
     from .render.hud import StdHud, build_aim_points, build_mod_pills
     from .render.playfield import PlayfieldCamera
@@ -639,18 +641,23 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     from .render.textures import TextureBank
     from .render.video_bg import VideoBackground
     from .skin.skin import Skin
+    perf.mark("gl_imports_done")
 
     w, h = settings.resolution
     spr = SpriteRenderer(w, h)
+    perf.mark("setup:gl_spriterenderer", leaf=True)
     bank = TextureBank(spr)
+    perf.mark("setup:gl_texbank")
     bodies = SliderBodyRenderer(spr.ctx, w, h)
     cam = PlayfieldCamera(w, h)
+    perf.mark("setup:gl_init_done")
 
     # FAIL: the death point in MAP ms (None = pass or --no-fail-animation).
     # Gameplay freezes here, the fail sequence plays, then the F results.
     fail_time = (meta.fail_time if meta is not None
                  and not args.no_fail_animation else None)
 
+    perf.mark("setup:music_decode_early")
     # --- music decode, EARLY + OFF-THREAD (perf; byte-identical) -------------
     # decode_to_pcm (an ffmpeg subprocess with the inline loudnorm pass) is
     # the single largest setup cost (~3 s for a full track). Its inputs are
@@ -678,6 +685,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                 pitch=(meta is not None and meta.rate_pitch), loudnorm=True)
         _audio_pool.shutdown(wait=False)
 
+    perf.mark("setup:real_skin_core")
     # --- real-skin core textures (per-element procedural fallback) ---------------
     skin_elems = None
     if settings.skin_dir is not None:
@@ -687,6 +695,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         for line in skin_elems.report_lines():
             print(line, file=sys.stderr)
 
+    perf.mark("setup:4_10_background")
     # --- §4.10 background + dim envelope (fail-soft to the dark void) -------------
     bg_key = bg_size = dim_env = None
     bg_path = beatmap.get_related_file(beatmap_dir, beatmap.bg)
@@ -712,6 +721,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         [o.get_start_time() for o in beatmap.hit_objects],
         beatmap.diff.preempt, beatmap.pauses)
 
+    perf.mark("setup:4_10_loadvideos")
     # --- §4.10 LoadVideos (render/video_bg.py — the mania v2 port) ----------------
     video_bg = None
     if settings.load_video:
@@ -819,6 +829,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         mod_pills = (build_mod_pills(meta.mods, meta.lazer_mods,
                                      meta.rate_override)
                      if meta is not None else None)
+        perf.mark("setup:hud_build")
         hud = StdHud(spr, bank, settings, judgments, frames, beatmap,
                      skin_elems=skin_elems, health=health,
                      mods=meta.mods if meta is not None else 0,
@@ -834,6 +845,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                 and _header_is_standardised(meta)):
             hud.pin_final_score(meta.score)
 
+    perf.mark("setup:reds_results_screen")
     # --- RED'S results screen (render/results.py; §4.6 ShowResultsScreen) --------
     # fade_out_time is WALL seconds — × speed for map-ms (the same rate-mod
     # convention as results_screen_time; the pre-fix code forgot the ×speed)
@@ -845,6 +857,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # FAIL: the sequence lasts FailAnimation.duration=2500 ms WALL → ×speed
     fail_anim_len_ms = FAIL_DURATION_MS * speed
 
+    perf.mark("setup:wu_wd_rate")
     # --- WU/WD rate ramp (ModTimeRamp): build the wall<->map time warp ------------
     # A Wind Up / Wind Down replay ramps the clock rate LINEARLY across the map
     # (timewarp.TimeWarp). One warp drives the record clock, the audio warp and
@@ -869,6 +882,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # FAIL results: grade F + stats FROZEN at the death point (NOT the .osr's
     # full-map reconciled totals). Tally judgments up to fail_time from the
     # (un-reconciled) sim, peak combo up to death, accuracy from those counts.
+    perf.mark("setup:frozen")
     frozen = None
     if fail_time is not None and hud is not None:
         fc = hud.data.counts_at(fail_time)
@@ -888,6 +902,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
               f"{frozen['acc_pct']}% combo {frozen['max_combo']}x "
               f"score {frozen['score']} grade F", file=sys.stderr)
 
+    perf.mark("setup:results_build")
     results = results_start_ms = results_dur_wall_ms = None
     results_ssaa = None
     if settings.show_results and hud is not None and meta is not None:
@@ -898,6 +913,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         # renderer (shared GL context) and downscale each results frame to
         # the output res, so text stays crisp at sub-1080p outputs. No-op
         # at >=1080p (the card renders at output res as before).
+        perf.mark("setup:results_ssaa")
         results_spr = spr
         iw, ih = ssaa_internal_size(w, h)
         if (iw, ih) != (w, h):
@@ -910,6 +926,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             # `final`; the results screen converts its MAP age -> wall via this
             # rate (age_ms / speed), so hand it the end rate under a ramp.
             _results_speed = warp.final if warp is not None else speed
+            perf.mark("setup:lazer_results", leaf=True)
             results, results_dur_wall_ms = _build_lazer_results(
                 results_spr, settings, beatmap, meta, judgments, hud, fv,
                 frames, osu_path, args, _results_speed, frozen=frozen)
@@ -980,6 +997,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         track_override = tuple(c / 255.0
                                for c in skin_info.slider_track_override)
 
+    perf.mark("setup:flow_end_start")
     # --- flow: end/start + the §4.10 pre-roll (lead-in + seizure card) ------------
     # FAIL: gameplay ends at the death frame + the fall, never at map end
     end_ms = (fail_time + fail_anim_len_ms if fail_time is not None
@@ -1038,6 +1056,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     scene_mods = (meta.mods if meta is not None else 0) | getattr(
         args, "add_mods", 0)
 
+    perf.mark("setup:storyboard_phase_3")
     # --- storyboard (phase-3 renderer; auto-discovers the map .osb) -------------
     storyboard_renderer = None
     if settings.load_storyboard and osu_path is not None:
@@ -1066,6 +1085,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             print(f"WARNING: storyboard load failed ({e!r}) — rendering "
                   "without storyboard", file=sys.stderr)
 
+    perf.mark("setup:scene_build")
     scene = StdScene(
         beatmap, frames, cam, spr, bodies, bank,
         combo_colors=combo_colors,
@@ -1139,6 +1159,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         storyboard=storyboard_renderer,
     )
 
+    perf.mark("setup:keyframe_dump_mode")
     # --- keyframe dump mode -----------------------------------------------------
     if args.dump_frames:
         from PIL import Image
@@ -1162,6 +1183,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     output: Path = args.output
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    perf.mark("setup:offline_audio_music")
     # --- offline audio: music bed + §3.4 hitsounds (NO-BASS design) ---------------
     # map-ms -> render-relative wall-ms. For a ramp this is the exact warp; with
     # no ramp it is the ORIGINAL constant expression (byte-identical audio).
@@ -1175,6 +1197,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             return (m - render_start_ms) / speed
 
     audio_path = None
+    perf.mark("aud:mixer")
     mixer = AudioMixer(m2w(end_ms))
     have_audio = False
     afile = _audio_afile
@@ -1188,6 +1211,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                 # warp_music_pcm). adjust_pitch True (WU/WD default) shifts
                 # pitch with the rate; False keeps pitch (tempo-only).
                 from .record.audio import warp_music_pcm
+                perf.mark("aud:pcm_join", leaf=True)
                 pcm = (_audio_fut.result() if _audio_fut is not None
                        else decode_to_pcm(afile, rate=1.0, loudnorm=True))
                 pcm = warp_music_pcm(pcm, warp,
@@ -1196,6 +1220,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                 # NC/DC pitch the music with the rate; DT/HT (and every
                 # standard/bitmask rate, where rate_pitch is False) change
                 # tempo only. (Decoded off-thread above — same args.)
+                perf.mark("aud:pcm_join", leaf=True)
                 pcm = (_audio_fut.result() if _audio_fut is not None
                        else decode_to_pcm(
                            afile, rate=speed,
@@ -1205,6 +1230,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             # rate-adjusted / ramp-warped) music is laid at the wall position
             # of map time 0 — mix_at clips a negative head; a pre-roll delays
             # it instead
+            perf.mark("aud:lay_music")
             mixer.lay_music(pcm, m2w(0.0), volume=vol)
             have_audio = True
         except AudioError as e:
@@ -1227,6 +1253,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         from .skin.skin import Skin as SampleSkin
         sample_skin = SampleSkin(skin_dir=settings.skin_dir,
                                  fallback_dir=settings.default_skin_dir)
+        perf.mark("aud:sample_bank")
         sample_bank = SampleBank(
             skin=sample_skin, beatmap_dir=beatmap_dir,
             use_beatmap_samples=not settings.use_skin_hitsounds,
@@ -1245,6 +1272,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     if (settings.use_replay_hitsounds and judgments is not None
             and sample_bank is not None):
         from .record.hitsounds import collect_hitsound_events, mix_hitsounds
+        perf.mark("aud:collect_hs")
         oneshots, loops = collect_hitsound_events(
             beatmap, judgments, layered=skin_info.layered_hit_sounds)
         if fail_time is not None:
@@ -1252,11 +1280,13 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             # their hitsounds (loops clip at the death point)
             oneshots = [o for o in oneshots if o.time_ms < fail_time]
             loops = [l for l in loops if l.t0 < fail_time]
+        perf.mark("aud:mix_hitsounds", leaf=True)
         stats = mix_hitsounds(mixer, sample_bank, oneshots, loops,
                               speed=speed, start_ms=render_start_ms,
                               gain=hs_gain,
                               to_wall=(m2w if warp is not None else None))
         srcs = sample_bank.source_counts()
+        perf.mark("aud:hs_report")
         print(f"hitsounds: {stats.oneshots} one-shots, "
               f"{stats.loop_ms / 1000.0:.1f}s loops | samples: "
               f"beatmap {srcs['beatmap']}, skin {srcs['skin']}, "
@@ -1310,6 +1340,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # (danser LeadInTime semantics) — for a map-start render the region
     # is silent anyway; this also covers --start clips with a pre-roll
     if have_audio and (seizure_ms or lead_ms):
+        perf.mark("aud:post_fx")
         mixer.silence_before(m2w(start_ms))
 
     # §4.10 FadeOutTime, audio side.
@@ -1346,6 +1377,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
               f"(pitch-bend approximated)", file=sys.stderr)
 
     if have_audio:
+        perf.mark("aud:write_wav")
         audio_path = output.with_suffix(".audio.wav")
         mixer.write_wav(audio_path)
     else:
@@ -1363,6 +1395,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         preview_path = output.parent / (output.stem + ".embed.mp4")
         print(f"[std] inline preview -> {preview_path.name}",
               file=sys.stderr, flush=True)
+    perf.mark("aud:encoder_spawn")
     encoder = probe_encoder(settings.encoder)
     cmd = build_ffmpeg_cmd(
         encoder=encoder, resolution=(w, h), fps=settings.fps,
@@ -1372,7 +1405,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         encoder_device=settings.encoder_device,
         preview_path=preview_path,
         total_dur_s=(total_wall_ms / 1000.0 if preview_path is not None
-                     else None))
+                     else None),
+        pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24")
 
     last_pct = [-1]
 
@@ -1385,12 +1419,29 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     player = ScenePlayer(scene, end_ms, speed=speed,
                          start_ms=render_start_ms,
                          rate_fn=(warp.rate_at if warp is not None else None))
+    if (results is not None and results_start_ms is not None
+            and perf.envflag("R3D_STD_RESULTS_AHEAD")
+            and hasattr(results, "prebake_ahead")):
+        # Bake the outro's rolling score / stats / accuracy arc during
+        # gameplay instead of on the render thread (byte-identical: a memo of
+        # pure functions, any misprediction is just a miss).
+        from .record.pipeline import predict_draw_times
+        _rs = results_start_ms
+        results.prebake_ahead(
+            t - _rs for t in predict_draw_times(
+                settings.fps, render_start_ms, end_ms, speed,
+                warp.rate_at if warp is not None else None) if t >= _rs)
+    perf.mark("setup_done")
     t0 = time.monotonic()
     try:
         with FfmpegPipe(cmd, recycle=spr.recycle_frame) as pipe:
             n_frames = RecordPipeline(settings.fps, pipe.push,
                                       progress=progress).run(
                 player, total_ms=total_wall_ms)
+        # FfmpegPipe.__exit__ has returned: stdin closed, writer thread joined
+        # and ffmpeg reaped. Everything between drain_end and here is the
+        # encoder tail, which is invisible to a frames/second number.
+        perf.mark("encoder_done")
     finally:
         if video_bg is not None:
             video_bg.close()
@@ -1507,6 +1558,7 @@ def _print_hud_final_values(hud, judgments, meta=None, frozen=None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    perf.mark("main_entry")
     args = build_parser().parse_args(argv)
 
     # --no-replay: the beatmap may be the only positional

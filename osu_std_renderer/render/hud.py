@@ -230,6 +230,21 @@ GRADE_RANKING_ELEMENT = {      # grade → legacy small badge element
     "B": "ranking-B-small", "C": "ranking-C-small", "D": "ranking-D-small",
 }
 
+# Restrict the health-bar COLOUR pass to the texels whose geometry changed this
+# frame, instead of redrawing the whole bar. Measured headroom: the colour pass
+# covered 29514 texels/frame while only 7647 had changed geometry.
+_HP_INCR = perf.envflag("R3D_STD_HP_INCR")
+_HP_CENSUS = perf.envflag("R3D_STD_HP_CENSUS")
+# ABLATION, MEASUREMENT ONLY (output is wrong): skip the Argon health bar
+# entirely. hud_health is 16% of wall, but the row 11 atlas ablation showed that
+# saving 0.5 s of render-thread CPU moved fps by NOTHING -- so price the bar by
+# removing it before building a shader for it.
+_ABL_NOHPBAR = perf.envflag("R3D_STD_ABL_NOHPBAR")
+# Render the Argon bar in a SHADER instead of numpy (parity row 39). Ablation put
+# the ceiling at +12.6%. Not byte-identical: f32 vs f64 at rounding ties, so it is
+# default OFF until that call is made, same class as the chroma decision.
+_HP_GPU = perf.envflag("R3D_STD_HP_GPU")
+
 _TRACKING = 0.05               # procedural-glyph letter-spacing
 
 # --- Argon constants (values straight from the cited classes) -----------------------
@@ -1388,6 +1403,8 @@ class ArgonBarField:
         rows, cols = y1 - y0, x1 - x0
         if rows <= 0 or cols <= 0:
             return
+        if _HP_CENSUS:
+            perf.count("hp_geo_texels", rows * cols)
         agp = radius * g["gp"]
         if b <= a + 1e-9:
             D = self._dist_clip_to(self.pos(a), box, radius)
@@ -1483,10 +1500,16 @@ class ArgonBarField:
         if upd_r != radius:
             g["shrunk"] = True
         live = self._live_box(radius)
+        # The boxes whose GEOMETRY changed this frame. If the colours are also
+        # unchanged, these are the ONLY texels whose output bytes can differ, so
+        # the colour pass may be restricted to them. `None` means "no usable
+        # previous output" (cache built from scratch) -> full pass required.
+        upd_applied: list | None = []
         if (g["a"], g["b"]) != (a, b):
             if g["a"] is None:
                 upd = self._box_isect(live, self._sub_box(a, b, upd_r))
                 self._geo_update(g, a, b, radius, upd)
+                upd_applied = None
             else:
                 boxes = []
                 if g["a"] != a:
@@ -1504,8 +1527,9 @@ class ArgonBarField:
                         boxes = [(min(ba[0], bb[0]), max(ba[1], bb[1]),
                                   min(ba[2], bb[2]), max(ba[3], bb[3]))]
                 for ub in boxes:
-                    self._geo_update(g, a, b, radius,
-                                     self._box_isect(live, ub))
+                    ib = self._box_isect(live, ub)
+                    self._geo_update(g, a, b, radius, ib)
+                    upd_applied.append(ib)
             g["a"], g["b"] = a, b
         # Output-box shrink (byte-exact): past D = radius − 0.45·agp the
         # glow has mixv < 0.45 ⇒ 255·mix⁸·A·xgrad·alpha_mult < 0.5 (all
@@ -1524,14 +1548,71 @@ class ArgonBarField:
         if y1 <= y0 or x1 <= x0:
             return self._out_buffer(out_key, glow_rgba, (0, 0, 0, 0))
         box = (y0, y1, x0, x1)
+        # Colour signature: with the geometry cached, the output bytes depend on
+        # (a, b) only through core/inv/mix8, so everything ELSE that can move a
+        # byte is in here. Equal csig + unchanged geometry = unchanged output.
+        csig = (tuple(bar_rgb), tuple(glow_rgba), bool(xgrad), float(alpha_mult))
+        ent = self._out_bufs.get(out_key)
+        incr = (_HP_INCR and upd_applied is not None and ent is not None
+                and ent[1] is not None and g.get("csig") == csig)
+        if incr:
+            # Reuse the buffer WITHOUT the far-field refill: after any call it
+            # already holds the correct full-grid output, and a far-field texel's
+            # colour pass yields exactly the far-field constant (core=0, inv=1,
+            # mix8=0 -> rgb=rint(glow*255), alpha=0), so texels that just left the
+            # bar are corrected by their own geometry box rather than by erasing.
+            out = ent[0]
+            # NOT clipped to `box`: when the bar SHRINKS, the vacated texels lie
+            # outside the new colour box, and they are exactly the ones that must
+            # be rewritten to the far-field constant. Clipping to `box` skipped
+            # them and left stale bar pixels behind (max|d|=255 on shrink frames).
+            # The update boxes are already live-clipped by _geo_update.
+            cboxes = [c for c in upd_applied if c[1] > c[0] and c[3] > c[2]]
+            ent[2] = box     # region holding non-far-field data, for a later refill
+        else:
+            out = self._out_buffer(out_key, glow_rgba, box)
+            cboxes = [box]
+        if _HP_INCR:
+            perf.count("hp_incr_hit" if incr else "hp_incr_miss")
+            if incr and not cboxes:
+                perf.count("hp_incr_skipped_entirely")
+        g["csig"] = csig
+        for cb in cboxes:
+            if _HP_CENSUS:     # scaffolding, not free: this ran 2.19x/frame
+                perf.count("hp_colour_texels",
+                           (cb[1] - cb[0]) * (cb[3] - cb[2]))
+            self._colour_pass(g, cb, out, bar_rgb, glow_rgba, xgrad, alpha_mult)
+        if _HP_CENSUS:
+            perf.count("hp_grid_texels", self.gh * self.gw)
+        return out
+
+    def _colour_pass(self, g, box, out, bar_rgb, glow_rgba,
+                     xgrad: bool, alpha_mult: float) -> None:
+        """bar_rgba's colour chain over `box`, reading the CACHED geometry.
+
+        Lifted verbatim out of bar_rgba_geo so it can be run over several small
+        boxes instead of one big one; the op order is unchanged, which is what
+        keeps it bit-identical."""
+        y0, y1, x0, x1 = box
         rows, cols = y1 - y0, x1 - x0
         core = g["core"][y0:y1, x0:x1]
         inv = g["inv"][y0:y1, x0:x1]
+        if _HP_CENSUS:
+            # Headroom census: a texel with core==1 (solid interior) or
+            # core==0 & mix8==0 (far field) has a CONSTANT output -- only the
+            # outline band and the glow annulus need the full colour chain.
+            _m8 = g["mix8"][y0:y1, x0:x1]
+            _n = core.size
+            _solid = int(np.count_nonzero(core >= 1.0))
+            _far = int(np.count_nonzero((core <= 0.0) & (_m8 <= 0.0)))
+            perf.count("hpc_texels", _n)
+            perf.count("hpc_solid", _solid)
+            perf.count("hpc_far", _far)
+            perf.count("hpc_needs_chain", _n - _solid - _far)
         ga = self._s5[:rows, :cols]
         np.multiply(g["mix8"][y0:y1, x0:x1], glow_rgba[3], out=ga)
         t1 = self._s2[:rows, :cols]
         t2 = self._s3[:rows, :cols]
-        out = self._out_buffer(out_key, glow_rgba, box)
         for c in range(3):
             bc = bar_rgb[c]
             if bc == 1.0:                          # core*1.0 == core exact
@@ -1554,7 +1635,6 @@ class ArgonBarField:
         np.multiply(t2, 255.0, out=t2)
         np.rint(t2, out=t2)
         out[y0:y1, x0:x1, 3] = t2
-        return out
 
     def background_rgba(self) -> np.ndarray:
         """sh_ArgonBarPathBackground.fs: dark→light band + white rim."""
@@ -1883,8 +1963,8 @@ class StdHud:
                 self._legacy_combo(out, t)
             else:
                 self._argon_combo(out, t)
-        with perf.T("hud_health"):
-            if not self.legacy_health:
+        with perf.T("hud_health"), perf.P("health"):
+            if not self.legacy_health and not _ABL_NOHPBAR:
                 self._argon_health(out, t)
         with perf.T("hud_keys"):
             if self.legacy_keys:
@@ -2146,24 +2226,41 @@ class StdHud:
         # regenerate + re-upload only when the bar parameters actually
         # changed this frame (steady hp / no recent hit-flash repeats the
         # exact same texture; radii/portions/mults below are constants)
+        _gp_glow = ((HP_GLOW_RADIUS - HP_MAIN_RADIUS
+                     * (1.0 - HP_MAIN_GLOW_PORTION)) / HP_GLOW_RADIUS)
+        if _HP_GPU:
+            # The (d, s) field is frame-invariant, so it uploads once; from then
+            # on each bar is one quad with uniforms and NOTHING crosses the bus.
+            self.spr.ensure_bar_field(field.d, field.s, field.scale,
+                                      field.margin, field.w)
         gkey = (seg_lo, seg_hi, gbar_rgb, ggl)
         if gkey != self._hp_glow_key:
             self._hp_glow_key = gkey
-            glow_tex = field.bar_rgba_geo(
-                seg_lo, seg_hi, HP_GLOW_RADIUS,
-                (HP_GLOW_RADIUS - HP_MAIN_RADIUS
-                 * (1.0 - HP_MAIN_GLOW_PORTION)) / HP_GLOW_RADIUS,
-                gbar_rgb, ggl, xgrad=True, alpha_mult=0.9,
-                out_key="hp_glow")
-            self.spr.write_texture("hud_hp_glow", glow_tex)
+            if _HP_GPU:
+                self.spr.render_bar(
+                    "hud_hp_glow", seg_lo, seg_hi, field.pos(seg_lo),
+                    field.pos(seg_hi), HP_GLOW_RADIUS, _gp_glow, gbar_rgb, ggl,
+                    xgrad=True, alpha_mult=0.9)
+            else:
+                glow_tex = field.bar_rgba_geo(
+                    seg_lo, seg_hi, HP_GLOW_RADIUS, _gp_glow,
+                    gbar_rgb, ggl, xgrad=True, alpha_mult=0.9,
+                    out_key="hp_glow")
+                self.spr.write_texture("hud_hp_glow", glow_tex)
         mkey = (hp_now, bar_rgb, glow_rgba, alpha_main)
         if mkey != self._hp_main_key:
             self._hp_main_key = mkey
-            main_tex = field.bar_rgba_geo(0.0, hp_now, HP_MAIN_RADIUS,
-                                      HP_MAIN_GLOW_PORTION, bar_rgb,
-                                      glow_rgba, alpha_mult=alpha_main,
-                                      out_key="hp_main")
-            self.spr.write_texture("hud_hp_main", main_tex)
+            if _HP_GPU:
+                self.spr.render_bar(
+                    "hud_hp_main", 0.0, hp_now, field.pos(0.0),
+                    field.pos(hp_now), HP_MAIN_RADIUS, HP_MAIN_GLOW_PORTION,
+                    bar_rgb, glow_rgba, alpha_mult=alpha_main)
+            else:
+                main_tex = field.bar_rgba_geo(0.0, hp_now, HP_MAIN_RADIUS,
+                                          HP_MAIN_GLOW_PORTION, bar_rgb,
+                                          glow_rgba, alpha_mult=alpha_main,
+                                          out_key="hp_main")
+                self.spr.write_texture("hud_hp_main", main_tex)
         # content top-left at HP_POS minus the main radius padding row
         x0 = (HP_POS[0] - field.margin) * es
         y0 = (HP_POS[1] - field.margin) * es

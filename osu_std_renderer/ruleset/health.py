@@ -311,6 +311,7 @@ class HealthTimeline:
         self.bp_times: list[float] = []
         self.bp_values: list[float] = []
         self.miss_events: list[tuple[float, float]] = []
+        self._miss_times: list[float] = []     # bisect key, see last_miss_at
         self.gain_events: list[float] = []
 
         hp = 1.0
@@ -353,7 +354,16 @@ class HealthTimeline:
 
     def last_miss_at(self, t: float) -> tuple[float, float] | None:
         """(time, hp_before) of the last health-losing result at/before t."""
-        i = bisect.bisect_right([m[0] for m in self.miss_events], t) - 1
+        # The times list is built ONCE, not per call. This used to be
+        # `bisect_right([m[0] for m in self.miss_events], t)`, i.e. O(n) work
+        # wrapped around an O(log n) search, run once per frame from the health
+        # bar. Negligible on a clean play and worst on an F-rank map (it scales
+        # with MISS COUNT) -- exactly the fixture class we do not routinely test.
+        # Keyed on length because miss_events is append-only during the sim and
+        # read-only afterwards.
+        if len(self._miss_times) != len(self.miss_events):
+            self._miss_times = [m[0] for m in self.miss_events]
+        i = bisect.bisect_right(self._miss_times, t) - 1
         return self.miss_events[i] if i >= 0 else None
 
     def last_gain_at(self, t: float) -> float | None:
