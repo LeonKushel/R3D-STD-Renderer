@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+from array import array as _array
 from collections import deque
 from dataclasses import dataclass
 
@@ -64,6 +65,18 @@ _MAP_READBACK = perf.envflag("R3D_STD_MAP_READBACK")
 # every sprite on one texture, i.e. the minimum achievable call count (the floor).
 _ABL_NOMERGE = perf.envflag("R3D_STD_ABL_NOMERGE")
 _ABL_ONETEX = perf.envflag("R3D_STD_ABL_ONETEX")
+# MEASUREMENT ONLY (wrong pixels): price the per-sprite Python serialisation.
+# NOSER reuses a stale params block instead of running np.fromiter over 13
+# scalars per sprite; NOVBO additionally skips the vertex fill + VBO upload.
+# The fps delta vs a normal run is the CEILING for any faster serialiser.
+_ABL_NOSER = perf.envflag("R3D_STD_ABL_NOSER")
+_ABL_NOVBO = perf.envflag("R3D_STD_ABL_NOVBO")
+_abl_params: dict = {}
+# R3D_STD_SER_ARRAY (default OFF): serialise the per-sprite params through a
+# C-level array('f').extend of one tuple per sprite instead of np.fromiter over
+# a generator that yields 13 scalars per sprite (13 generator resumes each).
+# Same values, same double->float32 cast, so the frame stream is unchanged.
+_SER_ARRAY = perf.envflag("R3D_STD_SER_ARRAY")
 # Readback LATENCY in frames, decoupled from pool size (they are the same number in
 # the unmapped path). Taiko measured latency itself as flat from 3 to 16, so this
 # stays at std's historical 3; it exists so the pool can grow without adding delay.
@@ -657,16 +670,35 @@ class SpriteRenderer:
         # np.fromiter into a preallocated (n, 13) block — the same scalars
         # in the same order as the old list-of-tuples np.array (identical
         # f4 casts), without its per-element dtype discovery
-        params = np.fromiter(
-            (v for sp in ordered for v in (
-                sp.x, sp.y, sp.w, sp.h, sp.rotation,
-                sp.color[0], sp.color[1], sp.color[2], sp.color[3],
-                sp.uv_off[0], sp.uv_off[1], sp.uv_scale[0], sp.uv_scale[1])),
-            dtype="f4", count=n * 13).reshape(n, 13)
-        verts = self._verts[:n]          # corners/uv pre-filled, constant
-        verts[:, :, 4:] = params[:, None, :]
-        self.vbo.orphan()
-        self.vbo.write(verts)
+        params = _abl_params.get(n) if (_ABL_NOSER or _ABL_NOVBO) else None
+        _stale = params is not None
+        if params is None and _SER_ARRAY:
+            buf = _array("f")
+            ext = buf.extend
+            for sp in ordered:
+                ext((sp.x, sp.y, sp.w, sp.h, sp.rotation,
+                     *sp.color, *sp.uv_off, *sp.uv_scale))
+            # a colour/uv tuple of the wrong length would shift every later
+            # field: fall back to the indexed path rather than draw garbage
+            if len(buf) == n * 13:
+                params = np.frombuffer(buf, dtype="f4").reshape(n, 13)
+                perf.count("ser_array")
+            else:
+                perf.count("ser_array_fallback")
+        if params is None:
+            params = np.fromiter(
+                (v for sp in ordered for v in (
+                    sp.x, sp.y, sp.w, sp.h, sp.rotation,
+                    sp.color[0], sp.color[1], sp.color[2], sp.color[3],
+                    sp.uv_off[0], sp.uv_off[1], sp.uv_scale[0], sp.uv_scale[1])),
+                dtype="f4", count=n * 13).reshape(n, 13)
+            if _ABL_NOSER or _ABL_NOVBO:
+                _abl_params[n] = params
+        if not (_ABL_NOVBO and _stale):
+            verts = self._verts[:n]          # corners/uv pre-filled, constant
+            verts[:, :, 4:] = params[:, None, :]
+            self.vbo.orphan()
+            self.vbo.write(verts)
 
         textures = self._textures
         white = self._white
