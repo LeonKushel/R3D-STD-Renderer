@@ -117,7 +117,8 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      encoder_device: str | None = None,
                      preview_path: Path | None = None,
                      total_dur_s: float | None = None,
-                     pix_fmt: str = "rgb24") -> list[str]:
+                     pix_fmt: str = "rgb24",
+                     stream_master: bool = False) -> list[str]:
     """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape).
 
     `preview_path` (INLINE PREVIEW, R3D_PREVIEW_INLINE=1 in the CLI; default
@@ -192,8 +193,15 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # summed peaks without ducking.
         af = ([LOUDNORM] if loudnorm
               else ["alimiter=limit=0.95:level=disabled:attack=1:release=20"])
+        # STREAMABLE MASTER (R3D_STREAM_MASTER=1 in the CLI; default False):
+        # the loudness pass the contributor client would run on the finished
+        # file (loudnorm on the MIXED output) is applied here instead, so
+        # nothing has to rewrite the master after the render.
+        if stream_master and LOUDNORM not in af:
+            af = af + [LOUDNORM]
         acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
                   "-shortest"]
+    _mfast = [] if stream_master else ["-movflags", "+faststart"]
     if preview_path is None:
         cmd += ["-vf", _vf + ("," + _vm_tail if _vm_tail else "")]
         cmd += vc
@@ -201,7 +209,9 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
             if af:
                 cmd += ["-af", ",".join(af)]
             cmd += acodec
-        cmd += ["-movflags", "+faststart", str(output_path)]
+        # stream_master: no +faststart, which rewrites the whole file at close;
+        # the master is then written front to back and the site moves the moov.
+        cmd += _mfast + [str(output_path)]
         if os.environ.get("R3D_STD_NULL_SINK") == "1":
             return _null_sink_cmd()
         return cmd
@@ -231,13 +241,18 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # sits on the preview branch only and the master is byte-identical.
         graph.append(f"[1:a]{','.join(af) or 'anull'},"
                      f"aformat=sample_rates=48000[aout]")
-        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
+        if stream_master:
+            # the shared branch already carries the loudness pass (af above):
+            # master and preview get the same normalised audio
+            graph.append("[aout]asplit=2[am][ap]")
+        else:
+            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
     cmd += ["-filter_complex", ";".join(graph)]
     # output 1: the master, exactly as without the preview
     cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio_path is not None
                                else [])
     cmd += vc + acodec
-    cmd += ["-movflags", "+faststart", str(output_path)]
+    cmd += _mfast + [str(output_path)]
     # output 2: the preview. libx264 on every node, deliberately: a second
     # NVENC/VAAPI session can fail to open (session limits), and one failed
     # output kills the whole process and with it the render.

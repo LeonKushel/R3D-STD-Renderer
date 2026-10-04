@@ -1395,6 +1395,19 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         preview_path = output.parent / (output.stem + ".embed.mp4")
         print(f"[std] inline preview -> {preview_path.name}",
               file=sys.stderr, flush=True)
+    # STREAMABLE MASTER (R3D_STREAM_MASTER=1, default OFF): write the master
+    # front to back (no +faststart) with the final loudness pass already
+    # applied, so the contributor client can upload it WHILE it renders. The
+    # marker file tells the client this engine honoured the flag; without it
+    # the client keeps its post-render loudness pass.
+    stream_master = os.environ.get("R3D_STREAM_MASTER") == "1"
+    if stream_master:
+        import json as _json
+        (output.parent / (output.stem + ".stream.json")).write_text(_json.dumps(
+            {"schema": 1, "faststart": False,
+             "loudnorm": "loudnorm=I=-18:TP=-1.5:LRA=11"}))
+        print("[std] streamable master (no faststart, loudnorm in-engine)",
+              file=sys.stderr, flush=True)
     perf.mark("aud:encoder_spawn")
     encoder = probe_encoder(settings.encoder)
     cmd = build_ffmpeg_cmd(
@@ -1406,7 +1419,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         preview_path=preview_path,
         total_dur_s=(total_wall_ms / 1000.0 if preview_path is not None
                      else None),
-        pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24")
+        pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24",
+        stream_master=stream_master)
 
     last_pct = [-1]
 
