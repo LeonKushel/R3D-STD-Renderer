@@ -38,26 +38,29 @@ from .context import create_context
 
 # R3D_STD_GPU_YUV: convert RGB -> yuv420p ON THE GPU and read back 1.5 bytes/px
 # instead of 3, feeding ffmpeg `-pix_fmt yuv420p` so swscale converts nothing.
-# Ported from taiko (fleet-validated max|d|=0 vs swscale, +42.7% with a real
-# encoder); encode.py's docstring had already flagged this as "a later perf phase".
 #
-# THE CONVERSION IS BIT-EXACT vs swscale, and the formula is NOT the one in
-# libswscale's C source. ffmpeg's BGR24 fast path (`ff_rgb24toyv12`) truncates the
-# 2x2 average BEFORE the matrix: rx = (r11+r12+r21+r22) >> 2 then >> 15. The
-# shipped arm64 NEON build does NOT -- it sums and shifts ONCE (>> 17), keeping the
-# extra precision. Matching the source gives 83-88% exact; matching the binary
-# gives max|d|=0. Read the source for the shape, measure the binary for the
-# arithmetic.
+# THE CONVERSION IS THE ONE FFMPEG ITSELF APPLIES TO THIS ENGINE'S FRAMES, sample
+# for sample (see rgb_to_yuv420p for the arithmetic), so the encoder is handed
+# the same bytes either way and the mp4 is the same file.
 #
-# NOTE it is a LOSS against a null sink because its whole win is relieving encoder
-# back-pressure -- benchmark with a REAL encoder or the conclusion inverts.
-_GPU_YUV = perf.envflag("R3D_STD_GPU_YUV")
+# It was not always. The first version (ported from taiko) reproduced swscale's
+# OTHER routine, the bgr24 fast path: truncated luma and a 2x2 box average for
+# chroma. ffmpeg does not use that for rgb24; it uses its general scaler, which
+# rounds luma and filters chroma with two pixels across and EIGHT rows down. On
+# real frames the old shader came out one level darker in 56% of luma samples
+# and off by one in 50-66% of chroma samples (up to 7 at sharp colour edges).
+# The validation had compared the shader with an oracle of the same routine,
+# never with what ffmpeg does to rgb24: a test that shares the bug's assumption.
+#
+# NOTE its win is relieving the encoder process of the conversion, so benchmark
+# it with a REAL encoder: against a null sink it reads as a loss.
+_GPU_YUV = perf.envflag("R3D_STD_GPU_YUV", perf.FAST_DEFAULT)
 
 # R3D_STD_MAP_READBACK: hand the writer a pointer INTO the pixel-pack buffer
 # (glMapBufferRange) instead of copying the PBO into a numpy array. Parity row 7.
 # Live on std specifically because std has no composite thread -- that is what made
 # the same port measure ZERO on catch, where the render thread was already idling.
-_MAP_READBACK = perf.envflag("R3D_STD_MAP_READBACK")
+_MAP_READBACK = perf.envflag("R3D_STD_MAP_READBACK", perf.FAST_DEFAULT)
 # ABLATIONS, MEASUREMENT ONLY -- they do not preserve output. They exist to size
 # the draw-call win BEFORE building an atlas (row 11), because gl_sprites_draw
 # also covers vertex serialisation and the VBO write, so the call count cannot be
@@ -72,11 +75,18 @@ _ABL_ONETEX = perf.envflag("R3D_STD_ABL_ONETEX")
 _ABL_NOSER = perf.envflag("R3D_STD_ABL_NOSER")
 _ABL_NOVBO = perf.envflag("R3D_STD_ABL_NOVBO")
 _abl_params: dict = {}
-# R3D_STD_SER_ARRAY (default OFF): serialise the per-sprite params through a
-# C-level array('f').extend of one tuple per sprite instead of np.fromiter over
-# a generator that yields 13 scalars per sprite (13 generator resumes each).
-# Same values, same double->float32 cast, so the frame stream is unchanged.
-_SER_ARRAY = perf.envflag("R3D_STD_SER_ARRAY")
+# R3D_STD_SER_ARRAY (on by default on a Mac, see perf.FAST_DEFAULT): serialise
+# the per-sprite params by growing
+# one flat Python list (a 13-tuple per sprite, the colour/uv tuples read once
+# into locals) and converting it with array('f', list), instead of np.fromiter
+# over a generator that yields 13 scalars per sprite (13 generator resumes and
+# 8 repeated attribute loads each). 1.8x on the serialiser alone: 237 -> 131 us
+# for a 333-sprite frame. Same values through the same double -> float32 cast,
+# so the frame stream is unchanged.
+# (Its first form, array('f').extend of one star-unpacked tuple per sprite,
+# measured ~1.1x: extend() on a non-array converts item by item through the
+# generic iterator, and the star-unpack builds a list first.)
+_SER_ARRAY = perf.envflag("R3D_STD_SER_ARRAY", perf.FAST_DEFAULT)
 # Readback LATENCY in frames, decoupled from pool size (they are the same number in
 # the unmapped path). Taiko measured latency itself as flat from 3 to 16, so this
 # stays at std's historical 3; it exists so the pool can grow without adding delay.
@@ -88,10 +98,46 @@ _WRITER_QUEUE_FRAMES = 4
 # enough" corrupts output SILENTLY the moment anything holds a frame a beat longer
 # than assumed -- and a mapped slot that gets reused early is exactly that bug.
 _PBO_MARGIN = 3
+# R3D_STD_PBO_BATCH=K (mapped readback only; default 1 = one frame per buffer,
+# today's behaviour). On Apple's GL the mapped readback's stall is paid per
+# glMapBufferRange CALL, not per byte: ~0.3-0.8 ms each, the same at 720p and
+# 1080p, whatever the latency. With K > 1, K consecutive frames are read into
+# ONE pixel-pack buffer at K offsets and the buffer is mapped once, so that
+# stall is paid once per K frames. Same bytes, same order; frames just leave
+# up to K later.
+_PBO_BATCH = max(1, int(os.environ.get(
+    "R3D_STD_PBO_BATCH", "4" if perf.FAST_DEFAULT else "1")))
+# R3D_STD_MULTITEX (on by default on a Mac): several textures per draw call. A draw call
+# used to end wherever the next sprite used a different texture, and HUD text
+# is one texture per glyph: ~93 calls a frame for ~333 sprites (3.6 sprites
+# per call), each call a fixed cost in the driver. With this on, up to
+# _MT_UNITS textures are bound at once, every sprite carries the unit it
+# samples, and a call ends only when a batch needs one unit more than that or
+# the blend mode changes. Same sprites, same order, each fragment still does
+# the one texture(sampler, uv) lookup on the texture it used before.
+#
+# NOT EXACTLY IDENTICAL, though it is nearly everywhere. Frame-identical to the
+# one-texture path on 43 of 44 corpus maps at 720p and on the 16-case matrix;
+# on one failed play a single pixel came out one level different in some frames
+# of the fail animation (rotated, falling sprites): 1 pixel in 1 of 61 sampled
+# frames. It is the sampling inside the switch, not the vertex stage: the stock
+# vertex shader with the unit looked up per primitive gives the same pixel, and
+# computing the derivatives outside the switch (textureGrad) is worse. So this
+# sits with the GPU health bar in the "can move a pixel by one level" class,
+# and R3D_STD_MULTITEX=0 is the exact path.
+_MULTITEX = perf.envflag("R3D_STD_MULTITEX", perf.FAST_DEFAULT)
+# 15, not 16: moderngl binds a texture it creates or writes to on the driver's
+# LAST fragment texture unit, and Apple's GL offers the GL minimum of 16
+# (measured: default_texture_unit 15), so unit 15 is never handed to a batch.
+_MT_UNITS = 15
 
 _GL_PIXEL_PACK_BUFFER = 0x88EB
 _GL_MAP_READ_BIT = 0x0001
 _GL_MAP_WRITE_BIT = 0x0002
+_GL_READ_FRAMEBUFFER = 0x8CA8
+_GL_DRAW_FRAMEBUFFER = 0x8CA9
+_GL_COLOR_BUFFER_BIT = 0x4000
+_GL_NEAREST = 0x2600
 _gl_c = None
 
 
@@ -119,8 +165,7 @@ def _load_gl_c():
             except OSError:
                 continue
         if lib is None:
-            raise RuntimeError(
-                f"R3D_STD_MAP_READBACK: could not load GL from {names}")
+            raise RuntimeError(f"could not load GL from {names}")
         lib.glBindBuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
         lib.glBindBuffer.restype = None
         lib.glMapBufferRange.argtypes = [ctypes.c_uint, ctypes.c_ssize_t,
@@ -128,6 +173,11 @@ def _load_gl_c():
         lib.glMapBufferRange.restype = ctypes.c_void_p
         lib.glUnmapBuffer.argtypes = [ctypes.c_uint]
         lib.glUnmapBuffer.restype = ctypes.c_ubyte
+        lib.glBindFramebuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        lib.glBindFramebuffer.restype = None
+        lib.glBlitFramebuffer.argtypes = [ctypes.c_int] * 8 + [ctypes.c_uint,
+                                                               ctypes.c_uint]
+        lib.glBlitFramebuffer.restype = None
         _gl_c = lib
     return _gl_c
 _RGB2YUV_SHIFT = 15
@@ -140,32 +190,52 @@ def _yuv_coef(k, scale):
     return int(k * scale / 255.0 * (1 << _RGB2YUV_SHIFT) + 0.5)
 
 
+# ffmpeg's rgb24 -> yuv420p (libswscale's general path, default flags), recovered
+# from its own output and exact on every sample tested: 21 M samples over real
+# std frames, noise at three sizes and a one-pixel stripe pattern (ffmpeg 8.1).
+#   Y   = ((((RY*R + GY*G + BY*B) + (0x801 << 8)) >> 9) + 32) >> 6
+#   row = ((CU*R2 + CG*G2 + CB*B2) + (0x4001 << 9)) >> 10      R2 = the 2 pixels of
+#                                                              a column pair, summed
+#   C   = clamp((sum(_CHROMA_TAPS[k] * row[2j - 3 + k]) + (1 << 18)) >> 19, 0, 255)
+# with source rows clamped at the top and bottom edge. The eight weights sum to
+# 8192; rounding them to 8 bits (-4 -11 31 112 ...) matches only 92% on noise,
+# and a 2x2 box average only 7%: fit a filter on NOISE, a gradient hides it.
+_CHROMA_TAPS = (-116, -344, 984, 3572, 3572, 984, -344, -116)
+
+
+def _yuv_matrix():
+    RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
+    cu = (-_yuv_coef(0.169, 224), -_yuv_coef(0.331, 224), _yuv_coef(0.500, 224))
+    cv = (_yuv_coef(0.500, 224), -_yuv_coef(0.419, 224), -_yuv_coef(0.081, 224))
+    return (RY, GY, BY), cu, cv
+
+
 def rgb_to_yuv420p(rgb):
-    """CPU twin of the GPU conversion, bit-identical to it and to swscale.
+    """CPU twin of the GPU conversion: ffmpeg's own rgb24 -> yuv420p, exactly.
 
-    Not on the render path -- it is the ORACLE the GPU shader is validated
-    against, which is what chains the shader to swscale-exactness.
+    Not on the render path -- it is the ORACLE: tests/test_gpu_yuv.py holds it
+    equal to ffmpeg itself, and the shader pair is the same integer arithmetic.
 
-    `rgb` is (h, w, 3) uint8. Returns a flat uint8 yuv420p buffer (Y | U | V).
-    int64 accumulation on purpose: the >> must be an arithmetic shift on a signed
+    `rgb` is (h, w, 3) uint8, top-down. Returns a flat uint8 yuv420p buffer
+    (Y | U | V). int64 throughout: the shifts must be arithmetic on a signed
     type, and numpy's uint promotion rules make that easy to get subtly wrong."""
     h, w = rgb.shape[:2]
     r = rgb[..., 0].astype(np.int64)
     g = rgb[..., 1].astype(np.int64)
     b = rgb[..., 2].astype(np.int64)
-    S = _RGB2YUV_SHIFT
-    RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
-    RU, GU, BU = -_yuv_coef(0.169, 224), -_yuv_coef(0.331, 224), _yuv_coef(0.500, 224)
-    RV, GV, BV = _yuv_coef(0.500, 224), -_yuv_coef(0.419, 224), -_yuv_coef(0.081, 224)
-    y = (((RY * r + GY * g + BY * b) >> S) + 16).astype(np.uint8)
+    (RY, GY, BY), cu, cv = _yuv_matrix()
+    y = ((((RY * r + GY * g + BY * b) + (0x801 << 8)) >> 9) + 32) >> 6
+    r2, g2, b2 = (c[:, 0::2] + c[:, 1::2] for c in (r, g, b))
 
-    def s4(a):
-        return a[0::2, 0::2] + a[0::2, 1::2] + a[1::2, 0::2] + a[1::2, 1::2]
+    def chroma(c):
+        row = ((c[0] * r2 + c[1] * g2 + c[2] * b2) + (0x4001 << 9)) >> 10
+        acc = np.zeros((h // 2, w // 2), np.int64)
+        j2 = np.arange(h // 2) * 2
+        for k, tap in enumerate(_CHROMA_TAPS):
+            acc += tap * row[np.clip(j2 - 3 + k, 0, h - 1)]
+        return np.clip((acc + (1 << 18)) >> 19, 0, 255)
 
-    sr, sg, sb = s4(r), s4(g), s4(b)
-    # >> (S+2), NOT an averaged RGB then >> S -- see _GPU_YUV above.
-    u = (((RU * sr + GU * sg + BU * sb) >> (S + 2)) + 128).astype(np.uint8)
-    v = (((RV * sr + GV * sg + BV * sb) >> (S + 2)) + 128).astype(np.uint8)
+    u, v = chroma(cu), chroma(cv)
     out = np.empty(w * h * 3 // 2, np.uint8)
     out[:w * h] = y.ravel()
     out[w * h:w * h + u.size] = u.ravel()
@@ -210,10 +280,40 @@ void main() {
 }
 """
 
+# R3D_STD_MULTITEX variants. The vertex stage is _VERT plus one pass-through
+# attribute; the fragment stage picks its sampler with a switch on a value that
+# is constant over the primitive, so all four fragments of every 2x2 block take
+# the same branch and the implicit mip level is the one _FRAG computes.
+_VERT_MT = _VERT.replace(
+    "in vec2 in_uv_scale;", "in vec2 in_uv_scale;\nin float in_tex;").replace(
+    "flat out vec4 v_color;", "flat out vec4 v_color;\nflat out int v_tex;").replace(
+    "v_color = in_color;", "v_color = in_color;\n    v_tex = int(in_tex + 0.5);")
+_FRAG_MT = """
+#version 330
+in vec2 v_uv;
+flat in vec4 v_color;
+flat in int v_tex;
+%(uniforms)s
+out vec4 f_color;
+void main() {
+    vec4 t;
+    switch (v_tex) {
+%(cases)s
+    }
+    f_color = t * v_color;
+}
+""" % {
+    "uniforms": "\n".join(f"uniform sampler2D u_tex{i};"
+                          for i in range(_MT_UNITS)),
+    "cases": "\n".join(
+        (f"        case {i}:" if i < _MT_UNITS - 1 else "        default:")
+        + f" t = texture(u_tex{i}, v_uv); break;" for i in range(_MT_UNITS)),
+}
+
 # floats per vertex: in_pos(2) in_uv(2) center(2) size(2) rot(1) color(4)
-# uv_off(2) uv_scale(2)
-_VERT_FLOATS = 17
-_SPRITE_BYTES = 4 * _VERT_FLOATS * 4          # 4 corners × 17 f4
+# uv_off(2) uv_scale(2) [+ texture unit(1) under R3D_STD_MULTITEX]
+_VERT_FLOATS = 18 if _MULTITEX else 17
+_SPRITE_BYTES = 4 * _VERT_FLOATS * 4          # 4 corners × _VERT_FLOATS f4
 
 
 @dataclass(slots=True)
@@ -237,6 +337,41 @@ class Sprite:
     uv_scale: tuple[float, float] = (1.0, 1.0)
 
 
+def plan_texture_batches(ordered, n_norm: int, max_units: int):
+    """R3D_STD_MULTITEX's draw plan for sprites already in draw order, the
+    first n_norm of them normal-blend and the rest additive.
+
+    Returns (units, batches): units[i] = the texture unit sprite i samples, and
+    batches = [(first, end, [texture key per unit])] covering every sprite once,
+    in order. A batch ends when it would need more than max_units textures or
+    where the blend mode changes, never anywhere else."""
+    units: list = []
+    put = units.append
+    batches: list = []
+    n = len(ordered)
+    i = 0
+    for end in (n_norm, n):
+        if i >= end:
+            continue
+        first = i
+        slot: dict = {}                  # texture key -> unit, this batch
+        keys: list = []
+        for sp in (ordered[i:end] if (i or end != n) else ordered):
+            key = sp.texture_key
+            u = slot.get(key)
+            if u is None:
+                u = len(keys)
+                if u == max_units:       # full: this sprite opens a new batch
+                    batches.append((first, i, keys))
+                    first, slot, keys, u = i, {}, [], 0
+                slot[key] = u
+                keys.append(key)
+            put(u)
+            i += 1
+        batches.append((first, end, keys))
+    return units, batches
+
+
 class SpriteRenderer:
     def __init__(self, width: int, height: int,
                  ctx: "moderngl.Context | None" = None):
@@ -246,9 +381,16 @@ class SpriteRenderer:
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        self.prog = self.ctx.program(vertex_shader=_VERT, fragment_shader=_FRAG)
+        if _MULTITEX:
+            self.prog = self.ctx.program(vertex_shader=_VERT_MT,
+                                         fragment_shader=_FRAG_MT)
+            for i in range(_MT_UNITS):
+                self.prog[f"u_tex{i}"].value = i
+        else:
+            self.prog = self.ctx.program(vertex_shader=_VERT,
+                                         fragment_shader=_FRAG)
+            self.prog["u_tex"].value = 0
         self.prog["u_screen"].value = (float(width), float(height))
-        self.prog["u_tex"].value = 0
 
         # unit-quad corners + uv, replicated per sprite in _draw (v grows
         # downward with screen y — same corner order the old TRIANGLE_STRIP
@@ -273,6 +415,8 @@ class SpriteRenderer:
         self.fbo = self.ctx.framebuffer(color_attachments=[self.color_tex])
         self._textures: dict[str, "moderngl.Texture"] = {}
         self._nomip_keys: set[str] = set()
+        # key -> (texture, framebuffer over it) for blit_texture_from
+        self._blit_targets: dict = {}
         self._max_tex_cached: int | None = None
         self._warned_big: set = set()
         self._white = self._make_texture_rgba(np.full((1, 1, 4), 255, dtype="u1"))
@@ -293,6 +437,8 @@ class SpriteRenderer:
         # Readback latency, decoupled from pool size: equal in the unmapped path
         # (preserving today's behaviour exactly), smaller than it when mapping.
         self._lat = self._PBO_RING
+        self._batch = 1
+        self._slot_views: dict = {}
         # recycled CPU-side frame buffers for the PBO readback: a fresh
         # 6 MB np.empty per frame costs an mmap + page-fault storm; the
         # encoder's writer thread hands frames back via recycle_frame()
@@ -325,11 +471,13 @@ class SpriteRenderer:
         # the per-sprite attribute columns (same bytes as a fresh build)
         self._verts = np.empty((cap, 4, _VERT_FLOATS), dtype="f4")
         self._verts[:, :, 0:4] = self._corners
+        fmt, names = "2f 2f 2f 2f 1f 4f 2f 2f", [
+            "in_pos", "in_uv", "in_center", "in_size", "in_rot",
+            "in_color", "in_uv_off", "in_uv_scale"]
+        if _MULTITEX:
+            fmt, names = fmt + " 1f", names + ["in_tex"]
         self.vao = self.ctx.vertex_array(
-            self.prog,
-            [(self.vbo, "2f 2f 2f 2f 1f 4f 2f 2f",
-              "in_pos", "in_uv", "in_center", "in_size", "in_rot",
-              "in_color", "in_uv_off", "in_uv_scale")],
+            self.prog, [(self.vbo, fmt, *names)],
             index_buffer=self._ibo, index_element_size=4,
         )
         self._capacity = cap
@@ -410,6 +558,43 @@ class SpriteRenderer:
                 self._textures[key] = tex
                 self._nomip_keys.add(key)
             tex.write(np.ascontiguousarray(rgb), alignment=1)
+
+    def blit_texture_from(self, key: str, src: "SpriteRenderer") -> None:
+        """Make texture `key` hold `src`'s rendered frame, entirely on the GPU.
+
+        Same texels the round trip `write_texture_rgb(key, src.read_rgb())`
+        leaves, without the readback and the upload: a 1:1 NEAREST blit is an
+        exact copy, and its destination rows are flipped because GL keeps a
+        framebuffer's row 0 at the BOTTOM while our textures keep the image's
+        top row first (read_rgb's flipud). Alpha is then forced to 1.0, which
+        is what the 3-component texture sampled. LINEAR, no mips, default
+        wrap: the sampler state write_texture_rgb leaves. Both renderers must
+        share a GL context."""
+        w, h = src.width, src.height
+        ent = self._blit_targets.get(key)
+        if ent is None or ent[0].size != (w, h):
+            old = self._textures.pop(key, None)
+            if old is not None:
+                old.release()
+            if ent is not None:
+                ent[1].release()
+            tex = self.ctx.texture((w, h), 4)
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            ent = (tex, self.ctx.framebuffer(color_attachments=[tex]))
+            self._blit_targets[key] = ent
+            self._textures[key] = tex
+            self._nomip_keys.add(key)
+        tex, fbo = ent
+        g = _load_gl_c()
+        g.glBindFramebuffer(_GL_READ_FRAMEBUFFER, src.fbo.glo)
+        g.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, fbo.glo)
+        g.glBlitFramebuffer(0, 0, w, h, 0, h, w, 0,
+                            _GL_COLOR_BUFFER_BIT, _GL_NEAREST)
+        fbo.color_mask = (False, False, False, True)
+        fbo.clear(0.0, 0.0, 0.0, 1.0)
+        fbo.color_mask = (True, True, True, True)
+        # the raw binds above went behind moderngl's back
+        self.fbo.use()
 
     def has_texture(self, key: str) -> bool:
         return key in self._textures
@@ -673,18 +858,16 @@ class SpriteRenderer:
         params = _abl_params.get(n) if (_ABL_NOSER or _ABL_NOVBO) else None
         _stale = params is not None
         if params is None and _SER_ARRAY:
-            buf = _array("f")
-            ext = buf.extend
+            flat: list = []
             for sp in ordered:
-                ext((sp.x, sp.y, sp.w, sp.h, sp.rotation,
-                     *sp.color, *sp.uv_off, *sp.uv_scale))
-            # a colour/uv tuple of the wrong length would shift every later
-            # field: fall back to the indexed path rather than draw garbage
-            if len(buf) == n * 13:
-                params = np.frombuffer(buf, dtype="f4").reshape(n, 13)
-                perf.count("ser_array")
-            else:
-                perf.count("ser_array_fallback")
+                c = sp.color
+                o = sp.uv_off
+                s = sp.uv_scale
+                flat += (sp.x, sp.y, sp.w, sp.h, sp.rotation,
+                         c[0], c[1], c[2], c[3], o[0], o[1], s[0], s[1])
+            params = np.frombuffer(_array("f", flat),
+                                   dtype="f4").reshape(n, 13)
+            perf.count("ser_array")
         if params is None:
             params = np.fromiter(
                 (v for sp in ordered for v in (
@@ -694,6 +877,9 @@ class SpriteRenderer:
                 dtype="f4", count=n * 13).reshape(n, 13)
             if _ABL_NOSER or _ABL_NOVBO:
                 _abl_params[n] = params
+        if _MULTITEX:
+            self._draw_multitex(ordered, params, n, n_norm)
+            return
         if not (_ABL_NOVBO and _stale):
             verts = self._verts[:n]          # corners/uv pre-filled, constant
             verts[:, :, 4:] = params[:, None, :]
@@ -713,6 +899,32 @@ class SpriteRenderer:
             self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
             with perf.T("gl_runs"):
                 self._run_pass(texs, n_norm, n)
+            self.ctx.blend_func = (moderngl.SRC_ALPHA,
+                                   moderngl.ONE_MINUS_SRC_ALPHA)
+
+    def _draw_multitex(self, ordered, params, n: int, n_norm: int) -> None:
+        """R3D_STD_MULTITEX: the same quads in the same order, one draw call
+        per batch of up to _MT_UNITS distinct textures instead of one per run
+        of a single texture. The two blend passes stay separate calls."""
+        units, batches = plan_texture_batches(ordered, n_norm, _MT_UNITS)
+        verts = self._verts[:n]              # corners/uv pre-filled, constant
+        verts[:, :, 4:17] = params[:, None, :]
+        verts[:, :, 17] = np.array(units, dtype="f4")[:, None]
+        self.vbo.orphan()
+        self.vbo.write(verts)
+        textures = self._textures
+        white = self._white
+        render = self.vao.render
+        with perf.T("gl_runs"):
+            for first, end, keys in batches:
+                if first == n_norm and n_norm < n:
+                    self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+                for u, key in enumerate(keys):
+                    (textures.get(key, white) if key else white).use(location=u)
+                render(moderngl.TRIANGLES, vertices=(end - first) * 6,
+                       first=first * 6)
+                perf.count("draw_calls")
+        if n_norm < n:
             self.ctx.blend_func = (moderngl.SRC_ALPHA,
                                    moderngl.ONE_MINUS_SRC_ALPHA)
 
@@ -746,6 +958,13 @@ class SpriteRenderer:
         silently."""
         if not _MAP_READBACK:
             return self._PBO_RING
+        if self._batch > 1:
+            # In SLOTS of K frames. A slot comes round again n*K frames after
+            # its first frame was read; by then its LAST frame must be through
+            # the writer: K (rest of the slot) + K + lat (mapped that late) +
+            # queue + the frame mid-write + the one just popped, plus slack.
+            held = (self._lat + _WRITER_QUEUE_FRAMES + 1 + 1 + _PBO_MARGIN)
+            return 2 + -(-held // self._batch) + 1
         return _WRITER_QUEUE_FRAMES + 1 + 1 + self._lat + _PBO_MARGIN
 
     def _ensure_pbos(self, size: int) -> None:
@@ -758,8 +977,11 @@ class SpriteRenderer:
                     f"PBO ring already sized {self._pbo_size}, asked for {size}")
             return
         self._lat = _PBO_LAT if _MAP_READBACK else self._PBO_RING
+        self._batch = _PBO_BATCH if _MAP_READBACK else 1
         n = self._pool_depth()
-        self._pbos = [self.ctx.buffer(reserve=size) for _ in range(n)]
+        self._pbos = [self.ctx.buffer(reserve=size * self._batch)
+                      for _ in range(n)]
+        self._slot_views = {}
         if _MAP_READBACK:          # scaffolding: only meaningful for the mapped path
             perf.count("pbo_pool_depth", n)
             perf.count("pbo_latency", self._lat)
@@ -776,8 +998,45 @@ class SpriteRenderer:
             g.glUnmapBuffer(_GL_PIXEL_PACK_BUFFER)
             g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, 0)
             self._mapped[idx] = False
+            self._slot_views.pop(idx, None)
             perf.count("pbo_unmapped")   # inside the _MAP_READBACK branch already
         return buf
+
+    def _write_target(self):
+        """(buffer, byte offset) the frame about to be read goes to. One frame
+        per buffer normally; with R3D_STD_PBO_BATCH, K frames share a buffer
+        and it is unmapped only when its first frame is about to be rewritten."""
+        k = self._batch
+        idx = (self._pbo_head // k) % len(self._pbos)
+        off = (self._pbo_head % k) * self._pbo_size
+        buf = self._unmap_for_write(idx) if off == 0 else self._pbos[idx]
+        return buf, off
+
+    def _pop_ready(self) -> bool:
+        """May the oldest frame be handed out without stalling?"""
+        if self._batch == 1:
+            return self._pbo_head - self._pbo_tail >= self._lat
+        k = self._batch
+        if (self._pbo_tail // k) % len(self._pbos) in self._slot_views:
+            return True                 # its buffer is already mapped
+        # map a buffer only once it is full, and `lat` frames later
+        return self._pbo_head >= (self._pbo_tail // k + 1) * k + self._lat
+
+    def _slot_flat(self, idx: int) -> np.ndarray:
+        """The mapped view of a whole buffer, mapped once and shared by the
+        K frames in it."""
+        flat = self._slot_views.get(idx)
+        if flat is None:
+            flat = self._slot_views[idx] = self._map_slot(idx)
+        return flat
+
+    def _drain_align(self) -> None:
+        """After a drain the next frame must start a fresh buffer: the partly
+        filled one has just been mapped, and a mapped buffer cannot take a
+        glReadPixels."""
+        k = self._batch
+        if k > 1:
+            self._pbo_head = self._pbo_tail = -(-self._pbo_head // k) * k
 
     def _map_slot(self, idx: int) -> np.ndarray:
         """Flat uint8 view straight into the pixel-pack buffer -- no copy."""
@@ -785,7 +1044,8 @@ class SpriteRenderer:
         g = _load_gl_c()
         buf = self._pbos[idx]
         g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, buf.glo)
-        ptr = g.glMapBufferRange(_GL_PIXEL_PACK_BUFFER, 0, self._pbo_size,
+        nbytes = self._pbo_size * self._batch
+        ptr = g.glMapBufferRange(_GL_PIXEL_PACK_BUFFER, 0, nbytes,
                                  _GL_MAP_READ_BIT | _GL_MAP_WRITE_BIT)
         g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, 0)
         if not ptr:
@@ -793,7 +1053,7 @@ class SpriteRenderer:
         self._mapped[idx] = True
         perf.count("pbo_mapped")
         return np.ctypeslib.as_array(
-            (_ct.c_uint8 * self._pbo_size).from_address(ptr))
+            (_ct.c_uint8 * nbytes).from_address(ptr))
 
     def read_rgb_async(self) -> "np.ndarray | None":
         """Queue an async readback of the current fbo into a small PBO
@@ -804,19 +1064,23 @@ class SpriteRenderer:
         just ~RING-1 frames late. read_drain() flushes the tail."""
         with perf.T("readback"):
             self._ensure_pbos(self.width * self.height * 3)
-            buf = self._unmap_for_write(self._pbo_head % len(self._pbos))
-            self.fbo.read_into(buf, components=3, alignment=1)
+            buf, off = self._write_target()
+            self.fbo.read_into(buf, components=3, alignment=1,
+                               write_offset=off)
             self._pbo_head += 1
-            if self._pbo_head - self._pbo_tail < self._lat:
+            if not self._pop_ready():
                 return None
             return self._pop_pbo()
 
     def _pop_pbo(self) -> np.ndarray:
-        idx = self._pbo_tail % len(self._pbos)
+        k = self._batch
+        idx = (self._pbo_tail // k) % len(self._pbos)
+        off = (self._pbo_tail % k) * self._pbo_size
         self._pbo_tail += 1
         if _MAP_READBACK:
-            flat = self._map_slot(idx)
-            arr = flat.reshape((self.height, self.width, 3))
+            flat = self._slot_flat(idx) if k > 1 else self._map_slot(idx)
+            arr = flat[off:off + self._pbo_size].reshape(
+                (self.height, self.width, 3))
             return np.flipud(arr)  # same orientation contract as read_rgb
         buf = self._pbos[idx]
         arr = self._frame_buf()
@@ -854,6 +1118,8 @@ class SpriteRenderer:
         with perf.T("readback"):
             while self._pbos is not None and self._pbo_tail < self._pbo_head:
                 out.append(self._pop_pbo())
+            if self._pbos is not None:
+                self._drain_align()
         return out
 
     # ---- GPU RGB -> yuv420p ----------------------------------------------
@@ -861,8 +1127,9 @@ class SpriteRenderer:
     # ORIENTATION: nothing is flipped here, deliberately. Frames already reach
     # ffmpeg BOTTOM-UP and `-vf vflip` reorders the rows (see encode.py). That
     # stays correct for yuv420p: with an even height a vertical flip maps chroma
-    # row j to ch-1-j, whose luma pair is still even-aligned, so the planes are
-    # bit-identical to converting the top-down RGB.
+    # row j to ch-1-j, and the eight-row chroma window 2j-3 .. 2j+4 onto the
+    # window of ch-1-j (the weights are symmetric, the edge clamp is too), so
+    # the planes are bit-identical to converting the top-down RGB.
 
     def _ensure_yuv(self):
         """Lazily build the conversion pass. Built on first use so an unused flag
@@ -870,44 +1137,50 @@ class SpriteRenderer:
         if getattr(self, "_yuv_ready", False):
             return
         w, h = self.width, self.height
-        if (w & 1) or (h & 1):
+        if (w & 1) or (h & 1) or h < 12:
+            # under 12 rows swscale shortens its chroma filter instead of
+            # clamping at the edges, and this conversion stops being its twin
             raise RuntimeError(
-                f"R3D_STD_GPU_YUV needs even dimensions, got {w}x{h}")
-        RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
-        RU = -_yuv_coef(0.169, 224); GU = -_yuv_coef(0.331, 224)
-        BU = _yuv_coef(0.500, 224)
-        RV = _yuv_coef(0.500, 224); GV = -_yuv_coef(0.419, 224)
-        BV = -_yuv_coef(0.081, 224)
-        S = _RGB2YUV_SHIFT
+                f"R3D_STD_GPU_YUV needs even dimensions and at least 12 rows, "
+                f"got {w}x{h}")
+        (RY, GY, BY), (RU, GU, BU), (RV, GV, BV) = _yuv_matrix()
         vert = ("#version 330\nin vec2 in_pos;\n"
                 "void main(){ gl_Position = vec4(in_pos,0.0,1.0); }")
-        # INTEGER math throughout: the shifts must be exact. Texture samples come
-        # back as normalised floats, so `int(v*255.0 + 0.5)` recovers the byte --
-        # float32 holds 0..255 exactly, and the +0.5 stops the n/255*255 round-trip
-        # landing a hair under n and truncating to n-1.
+        # INTEGER math throughout (see rgb_to_yuv420p, the same arithmetic): the
+        # shifts must be exact. Texture samples come back as normalised floats,
+        # so `int(v*255.0 + 0.5)` recovers the byte -- float32 holds 0..255
+        # exactly, and the +0.5 stops the n/255*255 round-trip landing a hair
+        # under n and truncating to n-1. Every sum stays inside int32: the
+        # largest is the chroma accumulator, under 1.6e8.
         frag_y = f"""#version 330
         uniform sampler2D scene;
         out float outY;
         void main() {{
             vec3 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0).rgb;
             int r = int(c.r*255.0+0.5), g = int(c.g*255.0+0.5), b = int(c.b*255.0+0.5);
-            outY = float((({RY}*r + {GY}*g + {BY}*b) >> {S}) + 16) / 255.0;
+            outY = float(((((({RY}*r + {GY}*g + {BY}*b) + {0x801 << 8}) >> 9) + 32) >> 6)) / 255.0;
         }}"""
-        # U and V share the 2x2 gather, so one pass with two attachments halves
-        # the sampling versus a pass each.
+        # U and V share the gather (two pixels across, eight rows down), so one
+        # pass with two attachments does both.
         frag_uv = f"""#version 330
         uniform sampler2D scene;
         layout(location=0) out float outU;
         layout(location=1) out float outV;
+        const int TAP[8] = int[8]({", ".join(str(t) for t in _CHROMA_TAPS)});
         void main() {{
-            ivec2 q = ivec2(gl_FragCoord.xy) * 2;
-            ivec3 s = ivec3(0);
-            for (int dy=0; dy<2; ++dy) for (int dx=0; dx<2; ++dx) {{
-                vec3 c = texelFetch(scene, q + ivec2(dx,dy), 0).rgb;
-                s += ivec3(int(c.r*255.0+0.5), int(c.g*255.0+0.5), int(c.b*255.0+0.5));
+            ivec2 p = ivec2(gl_FragCoord.xy);
+            int x = p.x * 2;
+            int ymax = textureSize(scene, 0).y - 1;
+            int su = 0, sv = 0;
+            for (int k = 0; k < 8; ++k) {{
+                int y = clamp(p.y * 2 - 3 + k, 0, ymax);
+                ivec3 s = ivec3(texelFetch(scene, ivec2(x, y), 0).rgb * 255.0 + 0.5)
+                        + ivec3(texelFetch(scene, ivec2(x + 1, y), 0).rgb * 255.0 + 0.5);
+                su += TAP[k] * ((({RU}*s.r + {GU}*s.g + {BU}*s.b) + {0x4001 << 9}) >> 10);
+                sv += TAP[k] * ((({RV}*s.r + {GV}*s.g + {BV}*s.b) + {0x4001 << 9}) >> 10);
             }}
-            outU = float((({RU}*s.r + {GU}*s.g + {BU}*s.b) >> {S + 2}) + 128) / 255.0;
-            outV = float((({RV}*s.r + {GV}*s.g + {BV}*s.b) >> {S + 2}) + 128) / 255.0;
+            outU = float(clamp((su + {1 << 18}) >> 19, 0, 255)) / 255.0;
+            outV = float(clamp((sv + {1 << 18}) >> 19, 0, 255)) / 255.0;
         }}"""
         self._yuv_quad = self.ctx.buffer(
             np.array([-1, -1, 3, -1, -1, 3], "f4").tobytes())
@@ -952,14 +1225,14 @@ class SpriteRenderer:
         w, h = self.width, self.height
         ysz, csz = w * h, (w // 2) * (h // 2)
         self._ensure_pbos(self._yuv_size)
-        buf = self._unmap_for_write(self._pbo_head % len(self._pbos))
-        self._fbo_y.read_into(buf, components=1, alignment=1, write_offset=0)
+        buf, off = self._write_target()
+        self._fbo_y.read_into(buf, components=1, alignment=1, write_offset=off)
         self._fbo_uv.read_into(buf, components=1, alignment=1, attachment=0,
-                               write_offset=ysz)
+                               write_offset=off + ysz)
         self._fbo_uv.read_into(buf, components=1, alignment=1, attachment=1,
-                               write_offset=ysz + csz)
+                               write_offset=off + ysz + csz)
         self._pbo_head += 1
-        if self._pbo_head - self._pbo_tail < self._lat:
+        if not self._pop_ready():
             return None
         return self._pop_pbo_flat()
 
@@ -1004,9 +1277,13 @@ class SpriteRenderer:
     def _pop_pbo_flat(self) -> np.ndarray:
         """_pop_pbo's flat sibling — yuv420p is planar, not (h, w, c)-shaped, and
         it must NOT be flipped (see the ORIENTATION note above)."""
-        idx = self._pbo_tail % len(self._pbos)
+        k = self._batch
+        idx = (self._pbo_tail // k) % len(self._pbos)
+        off = (self._pbo_tail % k) * self._pbo_size
         self._pbo_tail += 1
         if _MAP_READBACK:
+            if k > 1:
+                return self._slot_flat(idx)[off:off + self._pbo_size]
             return self._map_slot(idx)
         try:
             arr = self._yuv_pool.pop()
@@ -1022,6 +1299,8 @@ class SpriteRenderer:
         with perf.T("readback"):
             while self._pbos is not None and self._pbo_tail < self._pbo_head:
                 out.append(self._pop_pbo_flat())
+            if self._pbos is not None:
+                self._drain_align()
         return out
 
     def read_rgb(self) -> np.ndarray:

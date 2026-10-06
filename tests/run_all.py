@@ -99,6 +99,12 @@ MODULES = [
     # flip origin-adjust, additive z-slot blend, animation frame index, lazy
     # LRU texture cache; GL draw proven by an EGL smoke test (2026-07)
     "tests.test_storyboard_render",
+    # sub-1080p results outro on the GPU: integer LANCZOS == Pillow's
+    "tests.test_ssaa_gpu",
+    # several textures per draw call: the plan, and drawn bytes off vs on
+    "tests.test_multitex",
+    # GPU colour conversion == ffmpeg's own, sample for sample
+    "tests.test_gpu_yuv",
 ]
 
 

@@ -32,6 +32,16 @@ def envflag(name: str, default: bool = False) -> bool:
     return v.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+# ---- which render-path speedups are on with no switch set --------------------
+# On a Mac the whole set is ON by default: that is where every one of them was
+# built, timed and checked frame for frame against the stock path. Anywhere
+# else nothing is on until that platform has been validated and this rule is
+# widened. Each one stays a switch (R3D_X=0 off, R3D_X=1 on, on any platform),
+# and R3D_STD_STOCK=1 turns the whole set off at once: the stock render path,
+# for regression gates ("does stock still equal main?") and for bisecting.
+STOCK = envflag("R3D_STD_STOCK")
+FAST_DEFAULT = sys.platform == "darwin" and not STOCK
+
 # via envflag, so `R3D_TIMING=0` DISABLES rather than enables (row 42).
 TIMING = envflag("R3D_TIMING")
 FRAME_MD5 = envflag("R3D_FRAME_MD5")
