@@ -41,7 +41,13 @@ from .context import create_context
 #
 # THE CONVERSION IS THE ONE FFMPEG ITSELF APPLIES TO THIS ENGINE'S FRAMES, sample
 # for sample (see rgb_to_yuv420p for the arithmetic), so the encoder is handed
-# the same bytes either way and the mp4 is the same file.
+# the same bytes either way and the mp4 is the same file -- ON AN FFMPEG WHOSE
+# SWSCALE USES THAT ARITHMETIC. That is true of ffmpeg 8.1 on arm64 and NOT of
+# every build: ffmpeg 6.1.1 on x86-64 gives the same luma and chroma one level
+# apart on about 9% of noise samples (the two ffmpeg builds disagree with EACH
+# OTHER in exactly the same way). So "identical" is checked, not assumed: the
+# conversion is on by default only where ffmpeg_matches_twin() says this
+# machine's ffmpeg agrees with it; R3D_STD_GPU_YUV=1 still forces it on.
 #
 # It was not always. The first version (ported from taiko) reproduced swscale's
 # OTHER routine, the bgr24 fast path: truncated luma and a 2x2 box average for
@@ -54,7 +60,7 @@ from .context import create_context
 #
 # NOTE its win is relieving the encoder process of the conversion, so benchmark
 # it with a REAL encoder: against a null sink it reads as a loss.
-_GPU_YUV = perf.envflag("R3D_STD_GPU_YUV", perf.FAST_DEFAULT)
+_GPU_YUV = False          # decided below, once rgb_to_yuv420p exists
 
 # R3D_STD_MAP_READBACK: hand the writer a pointer INTO the pixel-pack buffer
 # (glMapBufferRange) instead of copying the PBO into a numpy array. Parity row 7.
@@ -241,6 +247,71 @@ def rgb_to_yuv420p(rgb):
     out[w * h:w * h + u.size] = u.ravel()
     out[w * h + u.size:] = v.ravel()
     return out
+
+_ffmpeg_match: "bool | None" = None
+
+
+def ffmpeg_matches_twin() -> bool:
+    """Does the ffmpeg on THIS machine convert rgb24 -> yuv420p to exactly the
+    bytes rgb_to_yuv420p gives? One small noise frame through it, once per
+    ffmpeg binary (the answer is cached beside the other r3d caches, keyed on
+    the binary's path, size and mtime). Any trouble counts as "no"."""
+    global _ffmpeg_match
+    if _ffmpeg_match is not None:
+        return _ffmpeg_match
+    import hashlib
+    import shutil
+    import subprocess
+    import tempfile
+    ok = False
+    try:
+        exe = shutil.which("ffmpeg")
+        if exe:
+            st = os.stat(os.path.realpath(exe))
+            key = hashlib.sha1(f"{os.path.realpath(exe)}|{st.st_size}|{st.st_mtime_ns}|v1"
+                               .encode()).hexdigest()[:16]
+            base = (os.path.expanduser("~/Library/Caches/r3d") if sys.platform == "darwin"
+                    else os.path.join(tempfile.gettempdir(), "r3d-cache"))
+            mark = os.path.join(base, f"gpu-yuv-probe-{key}")
+            try:
+                with open(mark) as fh:
+                    cached = fh.read().strip()
+            except OSError:
+                cached = ""
+            if cached in ("1", "0"):
+                ok = cached == "1"
+            else:
+                w, h = 128, 96
+                rgb = np.random.default_rng(20261006).integers(
+                    0, 256, (h, w, 3), dtype=np.uint8)
+                p = subprocess.run(
+                    [exe, "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                     "-s", f"{w}x{h}", "-i", "pipe:0", "-pix_fmt", "yuv420p",
+                     "-f", "rawvideo", "pipe:1"],
+                    input=rgb.tobytes(), capture_output=True, timeout=15)
+                ok = (p.returncode == 0
+                      and p.stdout == rgb_to_yuv420p(rgb).tobytes())
+                try:
+                    os.makedirs(base, exist_ok=True)
+                    with open(mark, "w") as fh:
+                        fh.write("1" if ok else "0")
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - a probe must never fail a render
+        ok = False
+    _ffmpeg_match = ok
+    return ok
+
+
+if os.environ.get("R3D_STD_GPU_YUV") is not None:
+    _GPU_YUV = perf.envflag("R3D_STD_GPU_YUV")
+elif perf.FAST_DEFAULT:
+    _GPU_YUV = ffmpeg_matches_twin()
+    if not _GPU_YUV:
+        print("gpu-yuv: this machine's ffmpeg converts RGB a little differently "
+              "from the GPU routine, so the conversion is left to ffmpeg "
+              "(R3D_STD_GPU_YUV=1 forces it)", file=sys.stderr)
+
 
 _VERT = """
 #version 330
