@@ -624,7 +624,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     """The Phase-1 record path: scene → record loop → ffmpeg."""
     # GL-touching imports live here so --parse-only works GL-less
     from .record.audio import AudioError, AudioMixer, decode_to_pcm
-    from .record.encode import FfmpegPipe, build_ffmpeg_cmd, probe_encoder
+    from .record.encode import (FfmpegPipe, build_ffmpeg_cmd,
+                                preview_on_media_engine, probe_encoder)
     from .record.pipeline import RecordPipeline
     from .render.background import (blur_background, build_dim_envelope,
                                     cover_size, load_background)
@@ -1432,7 +1433,9 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                      else None),
         pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24",
         stream_master=stream_master,
-        compact_path=compact_path)
+        compact_path=compact_path,
+        preview_hw=(preview_path is not None
+                    and preview_on_media_engine()))
 
     last_pct = [-1]
 
