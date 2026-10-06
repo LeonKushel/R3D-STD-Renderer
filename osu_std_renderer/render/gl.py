@@ -102,6 +102,19 @@ _PBO_MARGIN = 3
 # stall is paid once per K frames. Same bytes, same order; frames just leave
 # up to K later.
 _PBO_BATCH = max(1, int(os.environ.get("R3D_STD_PBO_BATCH", "1")))
+# R3D_STD_MULTITEX (default OFF): several textures per draw call. A draw call
+# used to end wherever the next sprite used a different texture, and HUD text
+# is one texture per glyph: ~93 calls a frame for ~333 sprites (3.6 sprites
+# per call), each call a fixed cost in the driver. With this on, up to
+# _MT_UNITS textures are bound at once, every sprite carries the unit it
+# samples, and a call ends only when a batch needs one unit more than that or
+# the blend mode changes. Same sprites, same order, each fragment still does
+# the one texture(sampler, uv) lookup on the texture it used before.
+_MULTITEX = perf.envflag("R3D_STD_MULTITEX")
+# 15, not 16: moderngl binds a texture it creates or writes to on the driver's
+# LAST fragment texture unit, and Apple's GL offers the GL minimum of 16
+# (measured: default_texture_unit 15), so unit 15 is never handed to a batch.
+_MT_UNITS = 15
 
 _GL_PIXEL_PACK_BUFFER = 0x88EB
 _GL_MAP_READ_BIT = 0x0001
@@ -232,10 +245,40 @@ void main() {
 }
 """
 
+# R3D_STD_MULTITEX variants. The vertex stage is _VERT plus one pass-through
+# attribute; the fragment stage picks its sampler with a switch on a value that
+# is constant over the primitive, so all four fragments of every 2x2 block take
+# the same branch and the implicit mip level is the one _FRAG computes.
+_VERT_MT = _VERT.replace(
+    "in vec2 in_uv_scale;", "in vec2 in_uv_scale;\nin float in_tex;").replace(
+    "flat out vec4 v_color;", "flat out vec4 v_color;\nflat out int v_tex;").replace(
+    "v_color = in_color;", "v_color = in_color;\n    v_tex = int(in_tex + 0.5);")
+_FRAG_MT = """
+#version 330
+in vec2 v_uv;
+flat in vec4 v_color;
+flat in int v_tex;
+%(uniforms)s
+out vec4 f_color;
+void main() {
+    vec4 t;
+    switch (v_tex) {
+%(cases)s
+    }
+    f_color = t * v_color;
+}
+""" % {
+    "uniforms": "\n".join(f"uniform sampler2D u_tex{i};"
+                          for i in range(_MT_UNITS)),
+    "cases": "\n".join(
+        (f"        case {i}:" if i < _MT_UNITS - 1 else "        default:")
+        + f" t = texture(u_tex{i}, v_uv); break;" for i in range(_MT_UNITS)),
+}
+
 # floats per vertex: in_pos(2) in_uv(2) center(2) size(2) rot(1) color(4)
-# uv_off(2) uv_scale(2)
-_VERT_FLOATS = 17
-_SPRITE_BYTES = 4 * _VERT_FLOATS * 4          # 4 corners × 17 f4
+# uv_off(2) uv_scale(2) [+ texture unit(1) under R3D_STD_MULTITEX]
+_VERT_FLOATS = 18 if _MULTITEX else 17
+_SPRITE_BYTES = 4 * _VERT_FLOATS * 4          # 4 corners × _VERT_FLOATS f4
 
 
 @dataclass(slots=True)
@@ -259,6 +302,41 @@ class Sprite:
     uv_scale: tuple[float, float] = (1.0, 1.0)
 
 
+def plan_texture_batches(ordered, n_norm: int, max_units: int):
+    """R3D_STD_MULTITEX's draw plan for sprites already in draw order, the
+    first n_norm of them normal-blend and the rest additive.
+
+    Returns (units, batches): units[i] = the texture unit sprite i samples, and
+    batches = [(first, end, [texture key per unit])] covering every sprite once,
+    in order. A batch ends when it would need more than max_units textures or
+    where the blend mode changes, never anywhere else."""
+    units: list = []
+    put = units.append
+    batches: list = []
+    n = len(ordered)
+    i = 0
+    for end in (n_norm, n):
+        if i >= end:
+            continue
+        first = i
+        slot: dict = {}                  # texture key -> unit, this batch
+        keys: list = []
+        for sp in (ordered[i:end] if (i or end != n) else ordered):
+            key = sp.texture_key
+            u = slot.get(key)
+            if u is None:
+                u = len(keys)
+                if u == max_units:       # full: this sprite opens a new batch
+                    batches.append((first, i, keys))
+                    first, slot, keys, u = i, {}, [], 0
+                slot[key] = u
+                keys.append(key)
+            put(u)
+            i += 1
+        batches.append((first, end, keys))
+    return units, batches
+
+
 class SpriteRenderer:
     def __init__(self, width: int, height: int,
                  ctx: "moderngl.Context | None" = None):
@@ -268,9 +346,16 @@ class SpriteRenderer:
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        self.prog = self.ctx.program(vertex_shader=_VERT, fragment_shader=_FRAG)
+        if _MULTITEX:
+            self.prog = self.ctx.program(vertex_shader=_VERT_MT,
+                                         fragment_shader=_FRAG_MT)
+            for i in range(_MT_UNITS):
+                self.prog[f"u_tex{i}"].value = i
+        else:
+            self.prog = self.ctx.program(vertex_shader=_VERT,
+                                         fragment_shader=_FRAG)
+            self.prog["u_tex"].value = 0
         self.prog["u_screen"].value = (float(width), float(height))
-        self.prog["u_tex"].value = 0
 
         # unit-quad corners + uv, replicated per sprite in _draw (v grows
         # downward with screen y — same corner order the old TRIANGLE_STRIP
@@ -351,11 +436,13 @@ class SpriteRenderer:
         # the per-sprite attribute columns (same bytes as a fresh build)
         self._verts = np.empty((cap, 4, _VERT_FLOATS), dtype="f4")
         self._verts[:, :, 0:4] = self._corners
+        fmt, names = "2f 2f 2f 2f 1f 4f 2f 2f", [
+            "in_pos", "in_uv", "in_center", "in_size", "in_rot",
+            "in_color", "in_uv_off", "in_uv_scale"]
+        if _MULTITEX:
+            fmt, names = fmt + " 1f", names + ["in_tex"]
         self.vao = self.ctx.vertex_array(
-            self.prog,
-            [(self.vbo, "2f 2f 2f 2f 1f 4f 2f 2f",
-              "in_pos", "in_uv", "in_center", "in_size", "in_rot",
-              "in_color", "in_uv_off", "in_uv_scale")],
+            self.prog, [(self.vbo, fmt, *names)],
             index_buffer=self._ibo, index_element_size=4,
         )
         self._capacity = cap
@@ -755,6 +842,9 @@ class SpriteRenderer:
                 dtype="f4", count=n * 13).reshape(n, 13)
             if _ABL_NOSER or _ABL_NOVBO:
                 _abl_params[n] = params
+        if _MULTITEX:
+            self._draw_multitex(ordered, params, n, n_norm)
+            return
         if not (_ABL_NOVBO and _stale):
             verts = self._verts[:n]          # corners/uv pre-filled, constant
             verts[:, :, 4:] = params[:, None, :]
@@ -774,6 +864,32 @@ class SpriteRenderer:
             self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
             with perf.T("gl_runs"):
                 self._run_pass(texs, n_norm, n)
+            self.ctx.blend_func = (moderngl.SRC_ALPHA,
+                                   moderngl.ONE_MINUS_SRC_ALPHA)
+
+    def _draw_multitex(self, ordered, params, n: int, n_norm: int) -> None:
+        """R3D_STD_MULTITEX: the same quads in the same order, one draw call
+        per batch of up to _MT_UNITS distinct textures instead of one per run
+        of a single texture. The two blend passes stay separate calls."""
+        units, batches = plan_texture_batches(ordered, n_norm, _MT_UNITS)
+        verts = self._verts[:n]              # corners/uv pre-filled, constant
+        verts[:, :, 4:17] = params[:, None, :]
+        verts[:, :, 17] = np.array(units, dtype="f4")[:, None]
+        self.vbo.orphan()
+        self.vbo.write(verts)
+        textures = self._textures
+        white = self._white
+        render = self.vao.render
+        with perf.T("gl_runs"):
+            for first, end, keys in batches:
+                if first == n_norm and n_norm < n:
+                    self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+                for u, key in enumerate(keys):
+                    (textures.get(key, white) if key else white).use(location=u)
+                render(moderngl.TRIANGLES, vertices=(end - first) * 6,
+                       first=first * 6)
+                perf.count("draw_calls")
+        if n_norm < n:
             self.ctx.blend_func = (moderngl.SRC_ALPHA,
                                    moderngl.ONE_MINUS_SRC_ALPHA)
 

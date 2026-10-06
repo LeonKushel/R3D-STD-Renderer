@@ -101,6 +101,8 @@ MODULES = [
     "tests.test_storyboard_render",
     # sub-1080p results outro on the GPU: integer LANCZOS == Pillow's
     "tests.test_ssaa_gpu",
+    # several textures per draw call: the plan, and drawn bytes off vs on
+    "tests.test_multitex",
 ]
 
 
