@@ -103,6 +103,8 @@ MODULES = [
     "tests.test_ssaa_gpu",
     # several textures per draw call: the plan, and drawn bytes off vs on
     "tests.test_multitex",
+    # GPU colour conversion == ffmpeg's own, sample for sample
+    "tests.test_gpu_yuv",
 ]
 
 

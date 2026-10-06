@@ -38,20 +38,23 @@ from .context import create_context
 
 # R3D_STD_GPU_YUV: convert RGB -> yuv420p ON THE GPU and read back 1.5 bytes/px
 # instead of 3, feeding ffmpeg `-pix_fmt yuv420p` so swscale converts nothing.
-# Ported from taiko (fleet-validated max|d|=0 vs swscale, +42.7% with a real
-# encoder); encode.py's docstring had already flagged this as "a later perf phase".
 #
-# THE CONVERSION IS BIT-EXACT vs swscale, and the formula is NOT the one in
-# libswscale's C source. ffmpeg's BGR24 fast path (`ff_rgb24toyv12`) truncates the
-# 2x2 average BEFORE the matrix: rx = (r11+r12+r21+r22) >> 2 then >> 15. The
-# shipped arm64 NEON build does NOT -- it sums and shifts ONCE (>> 17), keeping the
-# extra precision. Matching the source gives 83-88% exact; matching the binary
-# gives max|d|=0. Read the source for the shape, measure the binary for the
-# arithmetic.
+# THE CONVERSION IS THE ONE FFMPEG ITSELF APPLIES TO THIS ENGINE'S FRAMES, sample
+# for sample (see rgb_to_yuv420p for the arithmetic), so the encoder is handed
+# the same bytes either way and the mp4 is the same file.
 #
-# NOTE it is a LOSS against a null sink because its whole win is relieving encoder
-# back-pressure -- benchmark with a REAL encoder or the conclusion inverts.
-_GPU_YUV = perf.envflag("R3D_STD_GPU_YUV")
+# It was not always. The first version (ported from taiko) reproduced swscale's
+# OTHER routine, the bgr24 fast path: truncated luma and a 2x2 box average for
+# chroma. ffmpeg does not use that for rgb24; it uses its general scaler, which
+# rounds luma and filters chroma with two pixels across and EIGHT rows down. On
+# real frames the old shader came out one level darker in 56% of luma samples
+# and off by one in 50-66% of chroma samples (up to 7 at sharp colour edges).
+# The validation had compared the shader with an oracle of the same routine,
+# never with what ffmpeg does to rgb24: a test that shares the bug's assumption.
+#
+# NOTE its win is relieving the encoder process of the conversion, so benchmark
+# it with a REAL encoder: against a null sink it reads as a loss.
+_GPU_YUV = perf.envflag("R3D_STD_GPU_YUV", perf.FAST_DEFAULT)
 
 # R3D_STD_MAP_READBACK: hand the writer a pointer INTO the pixel-pack buffer
 # (glMapBufferRange) instead of copying the PBO into a numpy array. Parity row 7.
@@ -176,32 +179,52 @@ def _yuv_coef(k, scale):
     return int(k * scale / 255.0 * (1 << _RGB2YUV_SHIFT) + 0.5)
 
 
+# ffmpeg's rgb24 -> yuv420p (libswscale's general path, default flags), recovered
+# from its own output and exact on every sample tested: 21 M samples over real
+# std frames, noise at three sizes and a one-pixel stripe pattern (ffmpeg 8.1).
+#   Y   = ((((RY*R + GY*G + BY*B) + (0x801 << 8)) >> 9) + 32) >> 6
+#   row = ((CU*R2 + CG*G2 + CB*B2) + (0x4001 << 9)) >> 10      R2 = the 2 pixels of
+#                                                              a column pair, summed
+#   C   = clamp((sum(_CHROMA_TAPS[k] * row[2j - 3 + k]) + (1 << 18)) >> 19, 0, 255)
+# with source rows clamped at the top and bottom edge. The eight weights sum to
+# 8192; rounding them to 8 bits (-4 -11 31 112 ...) matches only 92% on noise,
+# and a 2x2 box average only 7%: fit a filter on NOISE, a gradient hides it.
+_CHROMA_TAPS = (-116, -344, 984, 3572, 3572, 984, -344, -116)
+
+
+def _yuv_matrix():
+    RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
+    cu = (-_yuv_coef(0.169, 224), -_yuv_coef(0.331, 224), _yuv_coef(0.500, 224))
+    cv = (_yuv_coef(0.500, 224), -_yuv_coef(0.419, 224), -_yuv_coef(0.081, 224))
+    return (RY, GY, BY), cu, cv
+
+
 def rgb_to_yuv420p(rgb):
-    """CPU twin of the GPU conversion, bit-identical to it and to swscale.
+    """CPU twin of the GPU conversion: ffmpeg's own rgb24 -> yuv420p, exactly.
 
-    Not on the render path -- it is the ORACLE the GPU shader is validated
-    against, which is what chains the shader to swscale-exactness.
+    Not on the render path -- it is the ORACLE: tests/test_gpu_yuv.py holds it
+    equal to ffmpeg itself, and the shader pair is the same integer arithmetic.
 
-    `rgb` is (h, w, 3) uint8. Returns a flat uint8 yuv420p buffer (Y | U | V).
-    int64 accumulation on purpose: the >> must be an arithmetic shift on a signed
+    `rgb` is (h, w, 3) uint8, top-down. Returns a flat uint8 yuv420p buffer
+    (Y | U | V). int64 throughout: the shifts must be arithmetic on a signed
     type, and numpy's uint promotion rules make that easy to get subtly wrong."""
     h, w = rgb.shape[:2]
     r = rgb[..., 0].astype(np.int64)
     g = rgb[..., 1].astype(np.int64)
     b = rgb[..., 2].astype(np.int64)
-    S = _RGB2YUV_SHIFT
-    RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
-    RU, GU, BU = -_yuv_coef(0.169, 224), -_yuv_coef(0.331, 224), _yuv_coef(0.500, 224)
-    RV, GV, BV = _yuv_coef(0.500, 224), -_yuv_coef(0.419, 224), -_yuv_coef(0.081, 224)
-    y = (((RY * r + GY * g + BY * b) >> S) + 16).astype(np.uint8)
+    (RY, GY, BY), cu, cv = _yuv_matrix()
+    y = ((((RY * r + GY * g + BY * b) + (0x801 << 8)) >> 9) + 32) >> 6
+    r2, g2, b2 = (c[:, 0::2] + c[:, 1::2] for c in (r, g, b))
 
-    def s4(a):
-        return a[0::2, 0::2] + a[0::2, 1::2] + a[1::2, 0::2] + a[1::2, 1::2]
+    def chroma(c):
+        row = ((c[0] * r2 + c[1] * g2 + c[2] * b2) + (0x4001 << 9)) >> 10
+        acc = np.zeros((h // 2, w // 2), np.int64)
+        j2 = np.arange(h // 2) * 2
+        for k, tap in enumerate(_CHROMA_TAPS):
+            acc += tap * row[np.clip(j2 - 3 + k, 0, h - 1)]
+        return np.clip((acc + (1 << 18)) >> 19, 0, 255)
 
-    sr, sg, sb = s4(r), s4(g), s4(b)
-    # >> (S+2), NOT an averaged RGB then >> S -- see _GPU_YUV above.
-    u = (((RU * sr + GU * sg + BU * sb) >> (S + 2)) + 128).astype(np.uint8)
-    v = (((RV * sr + GV * sg + BV * sb) >> (S + 2)) + 128).astype(np.uint8)
+    u, v = chroma(cu), chroma(cv)
     out = np.empty(w * h * 3 // 2, np.uint8)
     out[:w * h] = y.ravel()
     out[w * h:w * h + u.size] = u.ravel()
@@ -1093,8 +1116,9 @@ class SpriteRenderer:
     # ORIENTATION: nothing is flipped here, deliberately. Frames already reach
     # ffmpeg BOTTOM-UP and `-vf vflip` reorders the rows (see encode.py). That
     # stays correct for yuv420p: with an even height a vertical flip maps chroma
-    # row j to ch-1-j, whose luma pair is still even-aligned, so the planes are
-    # bit-identical to converting the top-down RGB.
+    # row j to ch-1-j, and the eight-row chroma window 2j-3 .. 2j+4 onto the
+    # window of ch-1-j (the weights are symmetric, the edge clamp is too), so
+    # the planes are bit-identical to converting the top-down RGB.
 
     def _ensure_yuv(self):
         """Lazily build the conversion pass. Built on first use so an unused flag
@@ -1102,44 +1126,50 @@ class SpriteRenderer:
         if getattr(self, "_yuv_ready", False):
             return
         w, h = self.width, self.height
-        if (w & 1) or (h & 1):
+        if (w & 1) or (h & 1) or h < 12:
+            # under 12 rows swscale shortens its chroma filter instead of
+            # clamping at the edges, and this conversion stops being its twin
             raise RuntimeError(
-                f"R3D_STD_GPU_YUV needs even dimensions, got {w}x{h}")
-        RY, GY, BY = (_yuv_coef(k, 219) for k in (0.299, 0.587, 0.114))
-        RU = -_yuv_coef(0.169, 224); GU = -_yuv_coef(0.331, 224)
-        BU = _yuv_coef(0.500, 224)
-        RV = _yuv_coef(0.500, 224); GV = -_yuv_coef(0.419, 224)
-        BV = -_yuv_coef(0.081, 224)
-        S = _RGB2YUV_SHIFT
+                f"R3D_STD_GPU_YUV needs even dimensions and at least 12 rows, "
+                f"got {w}x{h}")
+        (RY, GY, BY), (RU, GU, BU), (RV, GV, BV) = _yuv_matrix()
         vert = ("#version 330\nin vec2 in_pos;\n"
                 "void main(){ gl_Position = vec4(in_pos,0.0,1.0); }")
-        # INTEGER math throughout: the shifts must be exact. Texture samples come
-        # back as normalised floats, so `int(v*255.0 + 0.5)` recovers the byte --
-        # float32 holds 0..255 exactly, and the +0.5 stops the n/255*255 round-trip
-        # landing a hair under n and truncating to n-1.
+        # INTEGER math throughout (see rgb_to_yuv420p, the same arithmetic): the
+        # shifts must be exact. Texture samples come back as normalised floats,
+        # so `int(v*255.0 + 0.5)` recovers the byte -- float32 holds 0..255
+        # exactly, and the +0.5 stops the n/255*255 round-trip landing a hair
+        # under n and truncating to n-1. Every sum stays inside int32: the
+        # largest is the chroma accumulator, under 1.6e8.
         frag_y = f"""#version 330
         uniform sampler2D scene;
         out float outY;
         void main() {{
             vec3 c = texelFetch(scene, ivec2(gl_FragCoord.xy), 0).rgb;
             int r = int(c.r*255.0+0.5), g = int(c.g*255.0+0.5), b = int(c.b*255.0+0.5);
-            outY = float((({RY}*r + {GY}*g + {BY}*b) >> {S}) + 16) / 255.0;
+            outY = float(((((({RY}*r + {GY}*g + {BY}*b) + {0x801 << 8}) >> 9) + 32) >> 6)) / 255.0;
         }}"""
-        # U and V share the 2x2 gather, so one pass with two attachments halves
-        # the sampling versus a pass each.
+        # U and V share the gather (two pixels across, eight rows down), so one
+        # pass with two attachments does both.
         frag_uv = f"""#version 330
         uniform sampler2D scene;
         layout(location=0) out float outU;
         layout(location=1) out float outV;
+        const int TAP[8] = int[8]({", ".join(str(t) for t in _CHROMA_TAPS)});
         void main() {{
-            ivec2 q = ivec2(gl_FragCoord.xy) * 2;
-            ivec3 s = ivec3(0);
-            for (int dy=0; dy<2; ++dy) for (int dx=0; dx<2; ++dx) {{
-                vec3 c = texelFetch(scene, q + ivec2(dx,dy), 0).rgb;
-                s += ivec3(int(c.r*255.0+0.5), int(c.g*255.0+0.5), int(c.b*255.0+0.5));
+            ivec2 p = ivec2(gl_FragCoord.xy);
+            int x = p.x * 2;
+            int ymax = textureSize(scene, 0).y - 1;
+            int su = 0, sv = 0;
+            for (int k = 0; k < 8; ++k) {{
+                int y = clamp(p.y * 2 - 3 + k, 0, ymax);
+                ivec3 s = ivec3(texelFetch(scene, ivec2(x, y), 0).rgb * 255.0 + 0.5)
+                        + ivec3(texelFetch(scene, ivec2(x + 1, y), 0).rgb * 255.0 + 0.5);
+                su += TAP[k] * ((({RU}*s.r + {GU}*s.g + {BU}*s.b) + {0x4001 << 9}) >> 10);
+                sv += TAP[k] * ((({RV}*s.r + {GV}*s.g + {BV}*s.b) + {0x4001 << 9}) >> 10);
             }}
-            outU = float((({RU}*s.r + {GU}*s.g + {BU}*s.b) >> {S + 2}) + 128) / 255.0;
-            outV = float((({RV}*s.r + {GV}*s.g + {BV}*s.b) >> {S + 2}) + 128) / 255.0;
+            outU = float(clamp((su + {1 << 18}) >> 19, 0, 255)) / 255.0;
+            outV = float(clamp((sv + {1 << 18}) >> 19, 0, 255)) / 255.0;
         }}"""
         self._yuv_quad = self.ctx.buffer(
             np.array([-1, -1, 3, -1, -1, 3], "f4").tobytes())
