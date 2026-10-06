@@ -645,11 +645,31 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     perf.mark("gl_imports_done")
 
     w, h = settings.resolution
-    spr = SpriteRenderer(w, h)
+    # R3D_STD_METAL=1 (macOS only, default OFF): draw with the Metal core
+    # instead of OpenGL. Same scene code, same frames to ffmpeg; anything that
+    # goes wrong while setting it up falls back to the GL renderer below.
+    metal = False
+    if perf.envflag("R3D_STD_METAL") and sys.platform == "darwin":
+        try:
+            from .render.metal.renderer import MetalSpriteRenderer
+            from .render.metal.slider_body import MetalSliderBodyRenderer
+            if settings.bloom:
+                raise RuntimeError("bloom is not on the Metal path yet")
+            if not gl_mod._GPU_YUV:
+                raise RuntimeError("the Metal path needs R3D_STD_GPU_YUV on")
+            spr = MetalSpriteRenderer(w, h)
+            bodies = MetalSliderBodyRenderer(spr, w, h)
+            metal = True
+            print(f"metal:  {spr.core.device}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 - never fail a render over this
+            print(f"metal:  unavailable ({e}); using OpenGL", file=sys.stderr)
+    if not metal:
+        spr = SpriteRenderer(w, h)
     perf.mark("setup:gl_spriterenderer", leaf=True)
     bank = TextureBank(spr)
     perf.mark("setup:gl_texbank")
-    bodies = SliderBodyRenderer(spr.ctx, w, h)
+    if not metal:
+        bodies = SliderBodyRenderer(spr.ctx, w, h)
     cam = PlayfieldCamera(w, h)
     perf.mark("setup:gl_init_done")
 
@@ -918,7 +938,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         results_spr = spr
         iw, ih = ssaa_internal_size(w, h)
         if (iw, ih) != (w, h):
-            results_spr = SpriteRenderer(iw, ih, ctx=spr.ctx)
+            results_spr = (MetalSpriteRenderer(iw, ih, ring=3) if metal
+                           else SpriteRenderer(iw, ih, ctx=spr.ctx))
             results_ssaa = results_spr
             print(f"ssaa:   results supersampled at {iw}x{ih} → {w}x{h}",
                   file=sys.stderr)
