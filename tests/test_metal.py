@@ -1,0 +1,144 @@
+"""render/metal: the Metal renderer against the GL renderer it must stand in
+for, and its colour conversion against ffmpeg. Every test skips where there is
+no Metal library to load (anything but a Mac) or no GL context to compare with.
+
+What "equal" means here is deliberate. Sprites, slider bodies, the downscale
+and the colour conversion are compared for EXACT equality: they are. Whole HUD
+frames are not asserted equal, because GL's and Metal's mip generators part by
+one level on a few texels from mip level 3 down; that is covered by the
+whole-render comparison (see the Metal ledger), not by a unit test."""
+from __future__ import annotations
+
+import math
+import random
+import sys
+
+import numpy as np
+
+
+def _pair(w: int, h: int):
+    if sys.platform != "darwin":
+        return None
+    try:
+        from osu_std_renderer.render import gl
+        from osu_std_renderer.render.metal.renderer import MetalSpriteRenderer
+        return gl.SpriteRenderer(w, h), MetalSpriteRenderer(w, h)
+    except Exception as e:  # noqa: BLE001 - no GL context or no Metal device
+        print(f"SKIP ({e})")
+        return None
+
+
+def test_sprites_draw_what_gl_draws():
+    pair = _pair(1280, 720)
+    if pair is None:
+        return
+    from osu_std_renderer.render import gl
+    rng = np.random.default_rng(7)
+    tex = [(f"t{i}", rng.integers(0, 256, (int(rng.integers(3, 150)), int(rng.integers(3, 150)), 4),
+                                  dtype=np.uint8), bool(i % 3 == 0), bool(i % 2)) for i in range(40)]
+    frames = []
+    for spr in pair:
+        for key, px, clamp, mips in tex:
+            spr.upload_texture(key, px, clamp=clamp, mipmaps=mips)
+        spr.begin((0.1, 0.2, 0.3))
+        for n, seed in ((300, 5), (1, 6), (120, 7)):
+            random.seed(seed)
+            batch = []
+            for j in range(n):
+                key = None if j % 9 == 0 else f"t{random.randrange(40)}"
+                batch.append(gl.Sprite(
+                    random.uniform(0, 1280), random.uniform(0, 720),
+                    random.uniform(2, 260), random.uniform(2, 260), key,
+                    (random.random(), random.random(), random.random(), random.random()),
+                    rotation=random.uniform(-3, 3) if j % 4 == 0 else 0.0,
+                    additive=(j % 5 == 0),
+                    uv_off=(0.0, random.uniform(0, 0.5)) if j % 7 == 0 else (0.0, 0.0),
+                    uv_scale=(1.0, 0.5) if j % 7 == 0 else (1.0, 1.0)))
+            spr.draw(batch)
+        frames.append(np.asarray(spr.read_rgb()).astype(int))
+    d = np.abs(frames[0] - frames[1])
+    assert frames[0].max() - frames[0].min() > 100            # a real picture
+    assert d.max() == 0, f"{int((d != 0).sum())} values differ, largest {d.max()}"
+
+
+def test_slider_bodies_draw_what_gl_draws():
+    pair = _pair(1920, 1080)
+    if pair is None:
+        return
+    from osu_std_renderer.render import gl
+    from osu_std_renderer.render.metal.slider_body import MetalSliderBodyRenderer
+    from osu_std_renderer.render.slider_body import BodyStyle, SliderBodyRenderer
+    g, m = pair
+    w, h = 1920, 1080
+    random.seed(11)
+    paths = []
+    for _ in range(3):
+        cx, cy, r = random.uniform(0.25, 0.75) * w, random.uniform(0.3, 0.7) * h, random.uniform(0.1, 0.25) * h
+        a0 = random.uniform(0, 6.28)
+        paths.append([(cx + r * math.cos(a0 + t * 0.09), cy + r * math.sin(a0 + t * 0.07) * 0.8)
+                      for t in range(48)])
+    paths.append([(0.1 * w, 0.1 * h), (0.5 * w, 0.15 * h), (0.9 * w, 0.6 * h)])
+    out = []
+    for spr, bodies in ((g, SliderBodyRenderer(g.ctx, w, h)), (m, MetalSliderBodyRenderer(m, w, h))):
+        spr.begin((0.02, 0.02, 0.04))
+        for i, p in enumerate(paths):
+            style = BodyStyle(body_color=(0.2 + 0.2 * i, 0.5, 0.9 - 0.2 * i), alpha=0.6 + 0.1 * i)
+            body = bodies.build_body(p, radius_px=h * 0.045, style=style, snake=(0.0, 1.0 - 0.1 * i))
+            bodies.draw_body(body, spr.fbo, alpha=0.9)
+            spr.draw([gl.Sprite(p[0][0], p[0][1], h * 0.09, h * 0.09, None, (1, 1, 1, 0.5))])
+        out.append(np.asarray(spr.read_rgb()).astype(int))
+    d = np.abs(out[0] - out[1])
+    assert d.max() == 0, f"{int((d != 0).sum())} values differ, largest {d.max()}"
+
+
+def test_frame_conversion_equals_the_reference_routine():
+    pair = _pair(640, 360)
+    if pair is None:
+        return
+    from osu_std_renderer.render import gl
+    _, m = pair
+    rng = np.random.default_rng(3)
+    m.upload_texture("n", rng.integers(0, 256, (360, 640, 4), dtype=np.uint8), mipmaps=False)
+    for _ in range(2):
+        m.begin((0.0, 0.0, 0.0))
+        m.draw([gl.Sprite(320.0, 180.0, 640.0, 360.0, "n", (1.0, 1.0, 1.0, 1.0))])
+        rgb = m.read_rgb()                                   # top-down picture
+    m.begin((0.0, 0.0, 0.0))
+    m.draw([gl.Sprite(320.0, 180.0, 640.0, 360.0, "n", (1.0, 1.0, 1.0, 1.0))])
+    assert m.read_yuv_async() is None                        # the pipeline is filling
+    yuv = np.array(m.read_yuv_drain()[-1])
+    # the writer's contract: planes bottom-up, i.e. the conversion of the flipped picture
+    want = gl.rgb_to_yuv420p(np.ascontiguousarray(rgb[::-1]))
+    assert int((yuv != want).sum()) == 0
+
+
+def test_results_downscale_equals_pillow():
+    if sys.platform != "darwin":
+        return
+    try:
+        from osu_std_renderer.render.metal.renderer import MetalSpriteRenderer
+        from osu_std_renderer.render.metal.ssaa import MetalLanczos
+        from osu_std_renderer.render.scene import ssaa_internal_size
+    except Exception as e:  # noqa: BLE001
+        print(f"SKIP ({e})")
+        return
+    for ow, oh in ((1280, 720), (854, 480), (960, 540)):
+        iw, ih = ssaa_internal_size(ow, oh)
+        spr = MetalSpriteRenderer(ow, oh)
+        hi = MetalSpriteRenderer(iw, ih, core=spr.core)
+        assert MetalLanczos(spr, hi).self_check(), f"{iw}x{ih} -> {ow}x{oh} differs from Pillow"
+        spr.release()
+
+
+def test_a_reupload_never_rewrites_the_texture_in_place():
+    # frames already committed may not have run yet; an in-place rewrite would
+    # change what they sample (seen as wrong numbers on the results card)
+    pair = _pair(64, 64)
+    if pair is None:
+        return
+    _, m = pair
+    a = np.full((8, 8, 4), 10, np.uint8)
+    m.upload_texture("k", a)
+    first = m._tex["k"]
+    m.upload_texture("k", a + 1)
+    assert m._tex["k"] != first
