@@ -57,7 +57,7 @@ _GPU_YUV = perf.envflag("R3D_STD_GPU_YUV")
 # (glMapBufferRange) instead of copying the PBO into a numpy array. Parity row 7.
 # Live on std specifically because std has no composite thread -- that is what made
 # the same port measure ZERO on catch, where the render thread was already idling.
-_MAP_READBACK = perf.envflag("R3D_STD_MAP_READBACK")
+_MAP_READBACK = perf.envflag("R3D_STD_MAP_READBACK", perf.FAST_DEFAULT)
 # ABLATIONS, MEASUREMENT ONLY -- they do not preserve output. They exist to size
 # the draw-call win BEFORE building an atlas (row 11), because gl_sprites_draw
 # also covers vertex serialisation and the VBO write, so the call count cannot be
@@ -82,7 +82,7 @@ _abl_params: dict = {}
 # (Its first form, array('f').extend of one star-unpacked tuple per sprite,
 # measured ~1.1x: extend() on a non-array converts item by item through the
 # generic iterator, and the star-unpack builds a list first.)
-_SER_ARRAY = perf.envflag("R3D_STD_SER_ARRAY")
+_SER_ARRAY = perf.envflag("R3D_STD_SER_ARRAY", perf.FAST_DEFAULT)
 # Readback LATENCY in frames, decoupled from pool size (they are the same number in
 # the unmapped path). Taiko measured latency itself as flat from 3 to 16, so this
 # stays at std's historical 3; it exists so the pool can grow without adding delay.
@@ -101,7 +101,8 @@ _PBO_MARGIN = 3
 # ONE pixel-pack buffer at K offsets and the buffer is mapped once, so that
 # stall is paid once per K frames. Same bytes, same order; frames just leave
 # up to K later.
-_PBO_BATCH = max(1, int(os.environ.get("R3D_STD_PBO_BATCH", "1")))
+_PBO_BATCH = max(1, int(os.environ.get(
+    "R3D_STD_PBO_BATCH", "4" if perf.FAST_DEFAULT else "1")))
 # R3D_STD_MULTITEX (default OFF): several textures per draw call. A draw call
 # used to end wherever the next sprite used a different texture, and HUD text
 # is one texture per glyph: ~93 calls a frame for ~333 sprites (3.6 sprites
@@ -110,7 +111,7 @@ _PBO_BATCH = max(1, int(os.environ.get("R3D_STD_PBO_BATCH", "1")))
 # samples, and a call ends only when a batch needs one unit more than that or
 # the blend mode changes. Same sprites, same order, each fragment still does
 # the one texture(sampler, uv) lookup on the texture it used before.
-_MULTITEX = perf.envflag("R3D_STD_MULTITEX")
+_MULTITEX = perf.envflag("R3D_STD_MULTITEX", perf.FAST_DEFAULT)
 # 15, not 16: moderngl binds a texture it creates or writes to on the driver's
 # LAST fragment texture unit, and Apple's GL offers the GL minimum of 16
 # (measured: default_texture_unit 15), so unit 15 is never handed to a batch.

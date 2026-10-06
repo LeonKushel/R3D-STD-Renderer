@@ -327,7 +327,8 @@ class FfmpegPipe:
         # Catch measured pipe 256 fps -> socketpair 406 fps on this machine
         # against a 419 fps file-fed ceiling. Bytes on the wire are unchanged,
         # so output is byte-identical.
-        if sys.platform == "darwin" and os.environ.get("R3D_MAC_SOCKET_PIPE") == "1":
+        if sys.platform == "darwin" and perf.envflag("R3D_MAC_SOCKET_PIPE",
+                                                     perf.FAST_DEFAULT):
             import socket as _sock
             _par, _chi = _sock.socketpair(_sock.AF_UNIX, _sock.SOCK_STREAM)
             for _s, _opt in ((_par, _sock.SO_SNDBUF), (_chi, _sock.SO_RCVBUF)):

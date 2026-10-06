@@ -1420,7 +1420,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                          start_ms=render_start_ms,
                          rate_fn=(warp.rate_at if warp is not None else None))
     if (results is not None and results_start_ms is not None
-            and perf.envflag("R3D_STD_RESULTS_AHEAD")
+            and perf.envflag("R3D_STD_RESULTS_AHEAD", perf.FAST_DEFAULT)
             and hasattr(results, "prebake_ahead")):
         # Bake the outro's rolling score / stats / accuracy arc during
         # gameplay instead of on the render thread (byte-identical: a memo of

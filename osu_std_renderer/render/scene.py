@@ -185,7 +185,7 @@ _ABL_SSAA_NEAREST = perf.envflag("R3D_STD_ABL_SSAA_NEAREST")
 # hi-res frame to a small thread pool and pushes a FUTURE; the ffmpeg writer
 # resolves futures in FIFO order, so the byte stream is unchanged. PIL's resize
 # releases the GIL, so the pool really runs beside the render thread.
-_SSAA_ASYNC = perf.envflag("R3D_STD_SSAA_ASYNC")
+_SSAA_ASYNC = perf.envflag("R3D_STD_SSAA_ASYNC", perf.FAST_DEFAULT)
 _SSAA_WORKERS = 4
 # R3D_STD_SSAA_GPU: do the whole sub-1080p outro frame on the GPU. The scene
 # behind the card goes framebuffer -> texture by an exact blit instead of a
@@ -197,7 +197,7 @@ _SSAA_WORKERS = 4
 # Byte-identical by construction (the downscale is integer arithmetic), and
 # checked against Pillow on the live GL context before first use; if that
 # check fails the outro stays on the CPU path.
-_SSAA_GPU = perf.envflag("R3D_STD_SSAA_GPU")
+_SSAA_GPU = perf.envflag("R3D_STD_SSAA_GPU", perf.FAST_DEFAULT)
 
 
 def _ssaa_downscale(hi, ow: int, oh: int, yuv: bool):
