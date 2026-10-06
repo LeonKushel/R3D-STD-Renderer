@@ -738,8 +738,13 @@ def render_merge(osr_paths, beatmap_dir, output, *,
         mixer.write_wav(audio_path)
 
     encoder = probe_encoder("auto")
+    # The frames are yuv420p whenever the renderer converts on the GPU (the
+    # default on a Mac); tell ffmpeg, exactly as cli.py does. Without this a
+    # merged render fed yuv bytes to a command expecting rgb24.
+    from .render import gl as _gl_mod
     cmd = build_ffmpeg_cmd(encoder=encoder, resolution=(w, h), fps=fps,
-                           output_path=Path(output), audio_path=audio_path, loudnorm=False)
+                           output_path=Path(output), audio_path=audio_path, loudnorm=False,
+                           pix_fmt="yuv420p" if _gl_mod._GPU_YUV else "rgb24")
     player = ScenePlayer(scene, end_ms, speed=speed, start_ms=render_start_ms,
                          rate_fn=_breakdown_rate)
     with FfmpegPipe(cmd, recycle=spr.recycle_frame) as pipe:

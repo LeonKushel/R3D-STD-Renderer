@@ -75,7 +75,8 @@ _ABL_ONETEX = perf.envflag("R3D_STD_ABL_ONETEX")
 _ABL_NOSER = perf.envflag("R3D_STD_ABL_NOSER")
 _ABL_NOVBO = perf.envflag("R3D_STD_ABL_NOVBO")
 _abl_params: dict = {}
-# R3D_STD_SER_ARRAY (default OFF): serialise the per-sprite params by growing
+# R3D_STD_SER_ARRAY (on by default on a Mac, see perf.FAST_DEFAULT): serialise
+# the per-sprite params by growing
 # one flat Python list (a 13-tuple per sprite, the colour/uv tuples read once
 # into locals) and converting it with array('f', list), instead of np.fromiter
 # over a generator that yields 13 scalars per sprite (13 generator resumes and
@@ -106,7 +107,7 @@ _PBO_MARGIN = 3
 # up to K later.
 _PBO_BATCH = max(1, int(os.environ.get(
     "R3D_STD_PBO_BATCH", "4" if perf.FAST_DEFAULT else "1")))
-# R3D_STD_MULTITEX (default OFF): several textures per draw call. A draw call
+# R3D_STD_MULTITEX (on by default on a Mac): several textures per draw call. A draw call
 # used to end wherever the next sprite used a different texture, and HUD text
 # is one texture per glyph: ~93 calls a frame for ~333 sprites (3.6 sprites
 # per call), each call a fixed cost in the driver. With this on, up to
@@ -114,6 +115,16 @@ _PBO_BATCH = max(1, int(os.environ.get(
 # samples, and a call ends only when a batch needs one unit more than that or
 # the blend mode changes. Same sprites, same order, each fragment still does
 # the one texture(sampler, uv) lookup on the texture it used before.
+#
+# NOT EXACTLY IDENTICAL, though it is nearly everywhere. Frame-identical to the
+# one-texture path on 43 of 44 corpus maps at 720p and on the 16-case matrix;
+# on one failed play a single pixel came out one level different in some frames
+# of the fail animation (rotated, falling sprites): 1 pixel in 1 of 61 sampled
+# frames. It is the sampling inside the switch, not the vertex stage: the stock
+# vertex shader with the unit looked up per primitive gives the same pixel, and
+# computing the derivatives outside the switch (textureGrad) is worse. So this
+# sits with the GPU health bar in the "can move a pixel by one level" class,
+# and R3D_STD_MULTITEX=0 is the exact path.
 _MULTITEX = perf.envflag("R3D_STD_MULTITEX", perf.FAST_DEFAULT)
 # 15, not 16: moderngl binds a texture it creates or writes to on the driver's
 # LAST fragment texture unit, and Apple's GL offers the GL minimum of 16
