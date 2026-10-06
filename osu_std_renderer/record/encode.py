@@ -32,12 +32,16 @@ LOUDNORM = "loudnorm=I=-18:TP=-1.5:LRA=11"
 # taiko spells these R3D_X264_* and catch R3D_CATCH_X264_*; the un-prefixed form
 # is the useful one for a fleet, so std takes that.
 #
-# THE DEFAULTS PRESERVE std's CURRENT OUTPUT EXACTLY (preset "faster", no extra
-# x264-params, caller's crf). Adding the hooks is therefore byte-identical, which
-# keeps "can we tune the encoder" a separate, measurable question from "did we
-# silently change what we ship". taiko's tuned values are ultrafast +
-# cabac=1:8x8dct=1:ref=2 -- reachable here without a code edit.
-_X264_PRESET = os.environ.get("R3D_X264_PRESET", "faster")
+# DEFAULT CHANGED 2026-10-06: "veryfast" at crf 20 (was "faster" at crf 16).
+# This is a deliberate change to what a node WITHOUT a hardware encoder ships;
+# hardware-encoder nodes use the bitrate ladder below and are not affected.
+# Measured on std's own frames (lossless reference, 4637 frames at 1080p60):
+#   faster   crf 16   43.1 ms of encoder CPU per frame   9.58 Mbit/s   PSNR 47.3
+#   veryfast crf 20   24.4 ms                            6.06 Mbit/s   PSNR 43.8
+# and as a whole render of that replay with the inline preview: 40.6 -> 30.8 s,
+# master 94 -> 60 MB. taiko already ships veryfast at crf 20.
+# The old output is one env away: R3D_X264_PRESET=faster R3D_X264_CRF=16.
+_X264_PRESET = os.environ.get("R3D_X264_PRESET", "veryfast")
 _X264_CRF = os.environ.get("R3D_X264_CRF")       # None = use the caller's crf
 _X264_PARAMS = os.environ.get("R3D_X264_PARAMS", "")
 _X264_THREADS = os.environ.get("R3D_X264_THREADS")
@@ -190,7 +194,7 @@ def _preview_sink_args(preview_path) -> list:
 def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      output_path: Path, audio_path: Path | None = None,
                      audio_offset_ms: int = 0, video_bitrate: int | None = None,
-                     crf: int = 16, audio_bitrate: str = "192k",
+                     crf: int = 20, audio_bitrate: str = "192k",
                      loudnorm: bool = True, extra_vf: str = "",
                      encoder_device: str | None = None,
                      preview_path: Path | None = None,
