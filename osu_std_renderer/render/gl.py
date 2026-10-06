@@ -88,6 +88,14 @@ _WRITER_QUEUE_FRAMES = 4
 # enough" corrupts output SILENTLY the moment anything holds a frame a beat longer
 # than assumed -- and a mapped slot that gets reused early is exactly that bug.
 _PBO_MARGIN = 3
+# R3D_STD_PBO_BATCH=K (mapped readback only; default 1 = one frame per buffer,
+# today's behaviour). On Apple's GL the mapped readback's stall is paid per
+# glMapBufferRange CALL, not per byte: ~0.3-0.8 ms each, the same at 720p and
+# 1080p, whatever the latency. With K > 1, K consecutive frames are read into
+# ONE pixel-pack buffer at K offsets and the buffer is mapped once, so that
+# stall is paid once per K frames. Same bytes, same order; frames just leave
+# up to K later.
+_PBO_BATCH = max(1, int(os.environ.get("R3D_STD_PBO_BATCH", "1")))
 
 _GL_PIXEL_PACK_BUFFER = 0x88EB
 _GL_MAP_READ_BIT = 0x0001
@@ -303,6 +311,8 @@ class SpriteRenderer:
         # Readback latency, decoupled from pool size: equal in the unmapped path
         # (preserving today's behaviour exactly), smaller than it when mapping.
         self._lat = self._PBO_RING
+        self._batch = 1
+        self._slot_views: dict = {}
         # recycled CPU-side frame buffers for the PBO readback: a fresh
         # 6 MB np.empty per frame costs an mmap + page-fault storm; the
         # encoder's writer thread hands frames back via recycle_frame()
@@ -793,6 +803,13 @@ class SpriteRenderer:
         silently."""
         if not _MAP_READBACK:
             return self._PBO_RING
+        if self._batch > 1:
+            # In SLOTS of K frames. A slot comes round again n*K frames after
+            # its first frame was read; by then its LAST frame must be through
+            # the writer: K (rest of the slot) + K + lat (mapped that late) +
+            # queue + the frame mid-write + the one just popped, plus slack.
+            held = (self._lat + _WRITER_QUEUE_FRAMES + 1 + 1 + _PBO_MARGIN)
+            return 2 + -(-held // self._batch) + 1
         return _WRITER_QUEUE_FRAMES + 1 + 1 + self._lat + _PBO_MARGIN
 
     def _ensure_pbos(self, size: int) -> None:
@@ -805,8 +822,11 @@ class SpriteRenderer:
                     f"PBO ring already sized {self._pbo_size}, asked for {size}")
             return
         self._lat = _PBO_LAT if _MAP_READBACK else self._PBO_RING
+        self._batch = _PBO_BATCH if _MAP_READBACK else 1
         n = self._pool_depth()
-        self._pbos = [self.ctx.buffer(reserve=size) for _ in range(n)]
+        self._pbos = [self.ctx.buffer(reserve=size * self._batch)
+                      for _ in range(n)]
+        self._slot_views = {}
         if _MAP_READBACK:          # scaffolding: only meaningful for the mapped path
             perf.count("pbo_pool_depth", n)
             perf.count("pbo_latency", self._lat)
@@ -823,8 +843,45 @@ class SpriteRenderer:
             g.glUnmapBuffer(_GL_PIXEL_PACK_BUFFER)
             g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, 0)
             self._mapped[idx] = False
+            self._slot_views.pop(idx, None)
             perf.count("pbo_unmapped")   # inside the _MAP_READBACK branch already
         return buf
+
+    def _write_target(self):
+        """(buffer, byte offset) the frame about to be read goes to. One frame
+        per buffer normally; with R3D_STD_PBO_BATCH, K frames share a buffer
+        and it is unmapped only when its first frame is about to be rewritten."""
+        k = self._batch
+        idx = (self._pbo_head // k) % len(self._pbos)
+        off = (self._pbo_head % k) * self._pbo_size
+        buf = self._unmap_for_write(idx) if off == 0 else self._pbos[idx]
+        return buf, off
+
+    def _pop_ready(self) -> bool:
+        """May the oldest frame be handed out without stalling?"""
+        if self._batch == 1:
+            return self._pbo_head - self._pbo_tail >= self._lat
+        k = self._batch
+        if (self._pbo_tail // k) % len(self._pbos) in self._slot_views:
+            return True                 # its buffer is already mapped
+        # map a buffer only once it is full, and `lat` frames later
+        return self._pbo_head >= (self._pbo_tail // k + 1) * k + self._lat
+
+    def _slot_flat(self, idx: int) -> np.ndarray:
+        """The mapped view of a whole buffer, mapped once and shared by the
+        K frames in it."""
+        flat = self._slot_views.get(idx)
+        if flat is None:
+            flat = self._slot_views[idx] = self._map_slot(idx)
+        return flat
+
+    def _drain_align(self) -> None:
+        """After a drain the next frame must start a fresh buffer: the partly
+        filled one has just been mapped, and a mapped buffer cannot take a
+        glReadPixels."""
+        k = self._batch
+        if k > 1:
+            self._pbo_head = self._pbo_tail = -(-self._pbo_head // k) * k
 
     def _map_slot(self, idx: int) -> np.ndarray:
         """Flat uint8 view straight into the pixel-pack buffer -- no copy."""
@@ -832,7 +889,8 @@ class SpriteRenderer:
         g = _load_gl_c()
         buf = self._pbos[idx]
         g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, buf.glo)
-        ptr = g.glMapBufferRange(_GL_PIXEL_PACK_BUFFER, 0, self._pbo_size,
+        nbytes = self._pbo_size * self._batch
+        ptr = g.glMapBufferRange(_GL_PIXEL_PACK_BUFFER, 0, nbytes,
                                  _GL_MAP_READ_BIT | _GL_MAP_WRITE_BIT)
         g.glBindBuffer(_GL_PIXEL_PACK_BUFFER, 0)
         if not ptr:
@@ -840,7 +898,7 @@ class SpriteRenderer:
         self._mapped[idx] = True
         perf.count("pbo_mapped")
         return np.ctypeslib.as_array(
-            (_ct.c_uint8 * self._pbo_size).from_address(ptr))
+            (_ct.c_uint8 * nbytes).from_address(ptr))
 
     def read_rgb_async(self) -> "np.ndarray | None":
         """Queue an async readback of the current fbo into a small PBO
@@ -851,19 +909,23 @@ class SpriteRenderer:
         just ~RING-1 frames late. read_drain() flushes the tail."""
         with perf.T("readback"):
             self._ensure_pbos(self.width * self.height * 3)
-            buf = self._unmap_for_write(self._pbo_head % len(self._pbos))
-            self.fbo.read_into(buf, components=3, alignment=1)
+            buf, off = self._write_target()
+            self.fbo.read_into(buf, components=3, alignment=1,
+                               write_offset=off)
             self._pbo_head += 1
-            if self._pbo_head - self._pbo_tail < self._lat:
+            if not self._pop_ready():
                 return None
             return self._pop_pbo()
 
     def _pop_pbo(self) -> np.ndarray:
-        idx = self._pbo_tail % len(self._pbos)
+        k = self._batch
+        idx = (self._pbo_tail // k) % len(self._pbos)
+        off = (self._pbo_tail % k) * self._pbo_size
         self._pbo_tail += 1
         if _MAP_READBACK:
-            flat = self._map_slot(idx)
-            arr = flat.reshape((self.height, self.width, 3))
+            flat = self._slot_flat(idx) if k > 1 else self._map_slot(idx)
+            arr = flat[off:off + self._pbo_size].reshape(
+                (self.height, self.width, 3))
             return np.flipud(arr)  # same orientation contract as read_rgb
         buf = self._pbos[idx]
         arr = self._frame_buf()
@@ -901,6 +963,8 @@ class SpriteRenderer:
         with perf.T("readback"):
             while self._pbos is not None and self._pbo_tail < self._pbo_head:
                 out.append(self._pop_pbo())
+            if self._pbos is not None:
+                self._drain_align()
         return out
 
     # ---- GPU RGB -> yuv420p ----------------------------------------------
@@ -999,14 +1063,14 @@ class SpriteRenderer:
         w, h = self.width, self.height
         ysz, csz = w * h, (w // 2) * (h // 2)
         self._ensure_pbos(self._yuv_size)
-        buf = self._unmap_for_write(self._pbo_head % len(self._pbos))
-        self._fbo_y.read_into(buf, components=1, alignment=1, write_offset=0)
+        buf, off = self._write_target()
+        self._fbo_y.read_into(buf, components=1, alignment=1, write_offset=off)
         self._fbo_uv.read_into(buf, components=1, alignment=1, attachment=0,
-                               write_offset=ysz)
+                               write_offset=off + ysz)
         self._fbo_uv.read_into(buf, components=1, alignment=1, attachment=1,
-                               write_offset=ysz + csz)
+                               write_offset=off + ysz + csz)
         self._pbo_head += 1
-        if self._pbo_head - self._pbo_tail < self._lat:
+        if not self._pop_ready():
             return None
         return self._pop_pbo_flat()
 
@@ -1051,9 +1115,13 @@ class SpriteRenderer:
     def _pop_pbo_flat(self) -> np.ndarray:
         """_pop_pbo's flat sibling — yuv420p is planar, not (h, w, c)-shaped, and
         it must NOT be flipped (see the ORIENTATION note above)."""
-        idx = self._pbo_tail % len(self._pbos)
+        k = self._batch
+        idx = (self._pbo_tail // k) % len(self._pbos)
+        off = (self._pbo_tail % k) * self._pbo_size
         self._pbo_tail += 1
         if _MAP_READBACK:
+            if k > 1:
+                return self._slot_flat(idx)[off:off + self._pbo_size]
             return self._map_slot(idx)
         try:
             arr = self._yuv_pool.pop()
@@ -1069,6 +1137,8 @@ class SpriteRenderer:
         with perf.T("readback"):
             while self._pbos is not None and self._pbo_tail < self._pbo_head:
                 out.append(self._pop_pbo_flat())
+            if self._pbos is not None:
+                self._drain_align()
         return out
 
     def read_rgb(self) -> np.ndarray:
