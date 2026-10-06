@@ -1,8 +1,15 @@
 """R3D_STD_GPU_YUV must hand the encoder the bytes ffmpeg itself would have
 produced from the same RGB frame. Two links, both tested here:
 
-  ffmpeg  ==  rgb_to_yuv420p (numpy)      skipped where ffmpeg is not installed
+  ffmpeg  ==  rgb_to_yuv420p (numpy)      where this machine's ffmpeg uses that
+                                          arithmetic (ffmpeg_matches_twin)
   rgb_to_yuv420p  ==  the shader pair     skipped where there is no GL context
+
+swscale is not the same on every build: ffmpeg 8.1 on arm64 matches the twin on
+every sample, ffmpeg 6.1.1 on x86-64 gives chroma one level apart on ~9% of
+noise samples. The engine therefore PROBES the local ffmpeg and turns the
+conversion on by default only where it matches; on a build that does not, the
+first link is not a claim, and what is tested instead is that the probe says so.
 
 Noise is the test image on purpose: a smooth picture hides the chroma filter
 (a 2x2 box average agrees with the real eight-row filter on a gradient and on
@@ -46,7 +53,31 @@ def _images():
     yield "saturated red over blue", sat
 
 
+def test_probe_agrees_with_a_whole_frame():
+    # the engine decides from a 128x96 noise frame; a 1280x720 one must agree,
+    # whichever way this machine's ffmpeg goes
+    rgb = np.random.default_rng(99).integers(0, 256, (720, 1280, 3), dtype=np.uint8)
+    ref = _ffmpeg(rgb)
+    if ref is None:
+        print("SKIP (no usable ffmpeg)")
+        return
+    whole = bool((gl.rgb_to_yuv420p(rgb) == ref).all())
+    assert gl.ffmpeg_matches_twin() == whole
+
+
+def test_default_is_off_where_ffmpeg_differs():
+    import os
+    if os.environ.get("R3D_STD_GPU_YUV") is not None:
+        return                                   # forced either way: not the default
+    if not gl.ffmpeg_matches_twin():
+        assert gl._GPU_YUV is False
+
+
 def test_twin_equals_ffmpeg_on_every_sample():
+    if not gl.ffmpeg_matches_twin():
+        print("SKIP (this ffmpeg build converts differently; the GPU conversion "
+              "stays off by default here, see test_default_is_off_where_ffmpeg_differs)")
+        return
     ran = 0
     for name, rgb in _images():
         ref = _ffmpeg(rgb)
@@ -67,7 +98,8 @@ def test_under_twelve_rows_is_refused_not_approximated():
     if ref is None:
         print("SKIP (no usable ffmpeg)")
         return
-    assert (gl.rgb_to_yuv420p(rgb) != ref).any()          # documents WHY the guard exists
+    if gl.ffmpeg_matches_twin():
+        assert (gl.rgb_to_yuv420p(rgb) != ref).any()      # documents WHY the guard exists
     assert "12 rows" in open(gl.__file__).read()
 
 
