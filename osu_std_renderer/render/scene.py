@@ -2158,8 +2158,12 @@ class StdScene:
                 hi = self.results_ssaa
                 try:
                     with perf.T("ssaa_gpu_setup"):
-                        g = GpuLanczos(self.spr.ctx, hi.width, hi.height,
-                                       self.spr.width, self.spr.height)
+                        if getattr(self.spr, "is_metal", False):
+                            from .metal.ssaa import MetalLanczos
+                            g = MetalLanczos(self.spr, hi)
+                        else:
+                            g = GpuLanczos(self.spr.ctx, hi.width, hi.height,
+                                           self.spr.width, self.spr.height)
                         ok = g.self_check()
                 except Exception as e:  # noqa: BLE001 - never fail the render
                     ok, g = False, None

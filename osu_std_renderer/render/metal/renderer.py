@@ -98,14 +98,39 @@ class _Ctx:
             spr.add_scene(lambda: core.scissor(x, y, w, h))   # same row order as GL
 
 
+# framebuffer -> texture copy (render/gl.py blit_texture_from): rows flipped,
+# because a frame is stored bottom row first and an image texture top row
+# first; alpha forced to 1, which is what a 3-component texture samples as
+_COPY_MSL = """
+#include <metal_stdlib>
+using namespace metal;
+struct V { float4 pos [[position]]; };
+vertex V copy_vs(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2);
+    V o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;
+}
+fragment float4 copy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]]) {
+    uint2 ij = uint2(in.pos.xy);
+    return float4(src.read(uint2(ij.x, src.get_height() - 1 - ij.y)).rgb, 1.0);
+}
+"""
+
+
 class MetalSpriteRenderer:
+    is_metal = True
+
     def __init__(self, width: int, height: int, core: "mc.Core | None" = None,
                  ring: int = 12):
+        """With `core` given this renderer draws into a texture of its own on
+        that core (the results card at supersample size) instead of the frame."""
         self.width, self.height = width, height
         # GL's row order throughout, so every edge and every render-target
         # convention of the GL renderer carries over unchanged
         self.core = core or mc.Core(width, height, ring, bottom_up=True)
         self._own_core = core is None
+        self._target = 0 if core is None else self.core.tex_create(
+            width, height, mc.RGBA8, target=True)
+        self._flushed = False
         self._tex: dict[str, int] = {}
         self._tex_shape: dict[str, tuple] = {}
         self._white = self.core.tex_create(
@@ -120,7 +145,7 @@ class MetalSpriteRenderer:
         # the scene and the passes hand these to each other on the GL renderer;
         # here they only need to exist
         self.fbo = None
-        self.color_tex = None
+        self.color_tex = self._target      # what a later pass samples (0 = the frame)
         self.ctx = _Ctx(self)
 
     # ---- textures ----
@@ -129,9 +154,10 @@ class MetalSpriteRenderer:
         """rgba: HxWx4 uint8, row 0 at the top. Re-uploading a key replaces it."""
         h, w = rgba.shape[:2]
         old = self._tex.get(key)
-        if old is not None and self._tex_shape.get(key) == (h, w, clamp, mipmaps):
-            self.core.tex_update(old, rgba)
-            return
+        # Always a NEW texture, never an in-place rewrite: frames already
+        # committed may not have run yet and would sample the new contents
+        # (seen as wrong numbers on the results card while they roll). The
+        # frames in flight keep the old texture alive until they finish.
         if old is not None:
             self.core.tex_free(old)
         flags = (mc.MIP if mipmaps else 0) | (mc.CLAMP if clamp else 0)
@@ -204,6 +230,7 @@ class MetalSpriteRenderer:
         self._pre.clear()
         self._scene.clear()
         self._open = True
+        self._flushed = False
         for hook in self._resets:
             hook()
 
@@ -248,17 +275,41 @@ class MetalSpriteRenderer:
                 perf.count("draw_calls")
 
     def _replay(self) -> None:
+        """Encode this renderer's recorded frame, once: passes into textures,
+        then its own pass. Renderers sharing a core share the open frame."""
+        if self._flushed:
+            return
         c = self.core
-        c.frame_begin()
+        c.ensure_frame()
         for op in self._pre:
             op()
-        c.set_pass(0, self._clear)
+        c.set_pass(self._target, self._clear)
         for op in self._scene:
             if op[0] == "sprites":
                 c.sprites(op[1], op[2], op[3])
             else:
                 op[1]()
         self._open = False
+        self._flushed = True
+
+    def blit_texture_from(self, key: str, src: "MetalSpriteRenderer") -> None:
+        """Make texture `key` hold `src`'s frame as drawn so far, on the GPU
+        (render/gl.py blit_texture_from: same texels, same sampling state)."""
+        c = self.core
+        src._replay()
+        w, h = src.width, src.height
+        tid = self._tex.get(key)
+        if tid is None or self._tex_shape.get(key) != (h, w, False, False):
+            if tid is not None:
+                c.tex_free(tid)
+            tid = c.tex_create(w, h, mc.RGBA8, target=True)
+            self._tex[key] = tid
+            self._tex_shape[key] = (h, w, False, False)
+        if getattr(self, "_copy_pipe", None) is None:
+            self._copy_pipe = c.pipe_create(_COPY_MSL, "copy_vs", "copy_fs",
+                                            mc.RGBA8, mc.BLEND_OFF)
+        c.set_pass(tid, (0.0, 0.0, 0.0, 1.0))
+        c.draw(self._copy_pipe, 3, textures=(src._target,))
 
     # ---- frames out ----
     def read_yuv_async(self):
@@ -301,6 +352,10 @@ class MetalSpriteRenderer:
 
     def read_rgb(self) -> np.ndarray:
         """Synchronous (h, w, 3) uint8, top-down: dump-frames and tests."""
+        if self._target != 0:              # a renderer that draws into its own texture
+            self._replay()
+            self.core.aux_commit()
+            return np.ascontiguousarray(self.core.tex_read(self._target)[::-1, :, :3])
         if self.core.in_flight() > 0:
             raise RuntimeError("read_rgb with frames still in flight: drain first")
         self._replay()

@@ -938,7 +938,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         results_spr = spr
         iw, ih = ssaa_internal_size(w, h)
         if (iw, ih) != (w, h):
-            results_spr = (MetalSpriteRenderer(iw, ih, ring=3) if metal
+            results_spr = (MetalSpriteRenderer(iw, ih, core=spr.core) if metal
                            else SpriteRenderer(iw, ih, ctx=spr.ctx))
             results_ssaa = results_spr
             print(f"ssaa:   results supersampled at {iw}x{ih} → {w}x{h}",

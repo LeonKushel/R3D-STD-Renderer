@@ -218,14 +218,20 @@ func r3dUpload(_ c: Core, _ x: Tex, _ px: UnsafeRawPointer) -> Int32 {
               let bl = cb.makeBlitCommandEncoder() else { return -1 }
         bl.generateMipmaps(for: t)
         bl.endEncoding()
+        // No wait: every later command buffer on this queue runs after this
+        // one, so the chain exists before anything can sample it. Waiting here
+        // would also wait for every frame in flight, on each dynamic upload.
         cb.commit()
-        cb.waitUntilCompleted()
     }
     return 0
 }
 
 /// Replace a texture's whole contents (same size and format), mips rebuilt.
-/// The caller must not have the texture in a frame that is still being encoded.
+/// The write is IMMEDIATE on the CPU side while frames already committed may
+/// not have run yet, so a frame in flight that samples this texture would see
+/// the new contents. Only for textures no in-flight frame uses; a renderer
+/// that re-uploads during a render should create a new texture and free the
+/// old one (the in-flight frames keep the old one alive).
 @_cdecl("r3d_tex_update")
 public func r3d_tex_update(_ id: Int32, _ tid: Int32, _ px: UnsafeRawPointer) -> Int32 {
     guard let c = r3dCore(id), let x = c.tex[tid] else { return -1 }
@@ -434,6 +440,11 @@ public func r3d_draw(_ id: Int32, _ pid: Int32,
     }
     if let t = texIds {
         for k in 0..<Int(nTex) {
+            if t[k] == 0 {                 // 0 = this frame's own target, as drawn so far
+                e.setFragmentTexture(c.frameTex[c.head % c.ring], index: k)
+                e.setFragmentSamplerState(c.samplers[6], index: k)
+                continue
+            }
             guard let x = c.tex[t[k]] else { return -3 }
             e.setFragmentTexture(x.t, index: k)
             e.setFragmentSamplerState(c.samplers[x.sampler], index: k)
@@ -469,6 +480,19 @@ public func r3d_frame_commit(_ id: Int32, _ yuv: Int32) -> Int32 {
     cb.commit()
     c.inflight[s] = cb
     c.head += 1
+    c.cur = nil
+    return 0
+}
+
+/// Run what has been encoded since r3d_frame_begin NOW and wait for it, without
+/// making it a frame: nothing joins the ring. For work outside the frame
+/// sequence (self-checks, reading back an offscreen target).
+@_cdecl("r3d_aux_commit")
+public func r3d_aux_commit(_ id: Int32) -> Int32 {
+    guard let c = r3dCore(id), let cb = c.cur else { return -1 }
+    c.enc?.endEncoding(); c.enc = nil
+    cb.commit()
+    cb.waitUntilCompleted()
     c.cur = nil
     return 0
 }

@@ -40,6 +40,7 @@ _scissor = _sig("r3d_scissor", _i, _i, _i, _i, _i, _i)
 _sprites = _sig("r3d_sprites", _i, _i, _p, _i, _ip, _i, _i)
 _draw = _sig("r3d_draw", _i, _i, _i, _p, _i, _p, _i, _p, _i, _ip, _i, _i, _i, _i)
 _commit = _sig("r3d_frame_commit", _i, _i, _i)
+_aux_commit = _sig("r3d_aux_commit", _i, _i)
 _acquire = _sig("r3d_frame_acquire", _p, _i, _i, _i, _i)
 _in_flight = _sig("r3d_frames_in_flight", _i, _i)
 
@@ -75,6 +76,7 @@ class Core:
         self.bpr, self.yuv_len = bpr.value, ylen.value
         self.device = name.value.decode()
         self._fmt: dict[int, tuple[int, int, int]] = {}      # tex id -> (w, h, fmt)
+        self.frame_open = False
 
     def _check(self, rc: int, what: str) -> int:
         if rc < 0:
@@ -132,6 +134,17 @@ class Core:
     # ---- a frame ----
     def frame_begin(self) -> None:
         self._check(_frame_begin(self.id), "frame_begin")
+        self.frame_open = True
+
+    def ensure_frame(self) -> None:
+        """Renderers that share a core all encode into the one open frame."""
+        if not self.frame_open:
+            self.frame_begin()
+
+    def aux_commit(self) -> None:
+        """Run what is encoded now and wait; it does not become a frame."""
+        self._check(_aux_commit(self.id), "aux_commit")
+        self.frame_open = False
 
     def set_pass(self, tid: int = 0, clear=None) -> None:
         """Start a pass on texture `tid` (0 = this frame). `clear` is an RGBA
@@ -164,6 +177,7 @@ class Core:
 
     def frame_commit(self, yuv: bool) -> None:
         self._check(_commit(self.id, int(yuv)), "frame_commit")
+        self.frame_open = False
 
     def in_flight(self) -> int:
         return _in_flight(self.id)
