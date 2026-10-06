@@ -314,11 +314,11 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         c_h = min(c_h, int(h))
         c_fps = min(c_fps, int(round(float(fps))))
         graph = [f"[0:v]{_vf},split=3[vm0][vp0][vc0];[vm0]{_vm_tail or 'null'}[vm];"
-                 f"[vp0]scale=-2:720,fps={pfps}[vp];"
-                 f"[vc0]scale=-2:{c_h}:flags=bilinear,fps={c_fps}[vc]"]
+                 f"[vp0]fps={pfps},scale=-2:720[vp];"
+                 f"[vc0]fps={c_fps},scale=-2:{c_h}:flags=bilinear[vc]"]
     else:
         graph = [f"[0:v]{_vf},split=2[vm0][vp0];[vm0]{_vm_tail or 'null'}[vm];"
-                 f"[vp0]scale=-2:720,fps={pfps}[vp]"]
+                 f"[vp0]fps={pfps},scale=-2:720[vp]"]
     if audio_path is not None:
         # the audio file is input 1 (input 0 is the rawvideo pipe).
         # `aformat=sample_rates=48000` PINS the shared branch to the master's
