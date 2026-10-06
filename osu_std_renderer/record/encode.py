@@ -32,12 +32,16 @@ LOUDNORM = "loudnorm=I=-18:TP=-1.5:LRA=11"
 # taiko spells these R3D_X264_* and catch R3D_CATCH_X264_*; the un-prefixed form
 # is the useful one for a fleet, so std takes that.
 #
-# THE DEFAULTS PRESERVE std's CURRENT OUTPUT EXACTLY (preset "faster", no extra
-# x264-params, caller's crf). Adding the hooks is therefore byte-identical, which
-# keeps "can we tune the encoder" a separate, measurable question from "did we
-# silently change what we ship". taiko's tuned values are ultrafast +
-# cabac=1:8x8dct=1:ref=2 -- reachable here without a code edit.
-_X264_PRESET = os.environ.get("R3D_X264_PRESET", "faster")
+# DEFAULT CHANGED 2026-10-06: "veryfast" at crf 20 (was "faster" at crf 16).
+# This is a deliberate change to what a node WITHOUT a hardware encoder ships;
+# hardware-encoder nodes use the bitrate ladder below and are not affected.
+# Measured on std's own frames (lossless reference, 4637 frames at 1080p60):
+#   faster   crf 16   43.1 ms of encoder CPU per frame   9.58 Mbit/s   PSNR 47.3
+#   veryfast crf 20   24.4 ms                            6.06 Mbit/s   PSNR 43.8
+# and as a whole render of that replay with the inline preview: 40.6 -> 30.8 s,
+# master 94 -> 60 MB. taiko already ships veryfast at crf 20.
+# The old output is one env away: R3D_X264_PRESET=faster R3D_X264_CRF=16.
+_X264_PRESET = os.environ.get("R3D_X264_PRESET", "veryfast")
 _X264_CRF = os.environ.get("R3D_X264_CRF")       # None = use the caller's crf
 _X264_PARAMS = os.environ.get("R3D_X264_PARAMS", "")
 _X264_THREADS = os.environ.get("R3D_X264_THREADS")
@@ -109,15 +113,95 @@ def _null_sink_cmd() -> list[str]:
     return ["cat"]
 
 
+def compact_wanted(total_dur_s, w, h, fps, default_factor) -> bool:
+    """Whether to write the inline Discord copy for this render.
+
+    R3D_COMPACT_INLINE=1 asks for it. The copy costs a second software encode
+    for the whole render, and it is only used when the master is too big to be
+    the Discord file itself, so R3D_COMPACT_IF_OVER_BYTES=<n> limits it to
+    renders whose master is EXPECTED to exceed n bytes: duration x bitrate,
+    with the bitrate taken from R3D_COMPACT_EXPECT_BPS (what this node's
+    masters of this kind have actually averaged, supplied by the client) or,
+    lacking that, the encoder ladder times `default_factor`. Without a limit,
+    or without a duration, the copy is always written."""
+    if os.environ.get("R3D_COMPACT_INLINE") != "1":
+        return False
+    try:
+        limit = int(os.environ.get("R3D_COMPACT_IF_OVER_BYTES", "0") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0 or not total_dur_s or total_dur_s <= 0:
+        return True
+    try:
+        bps = float(os.environ.get("R3D_COMPACT_EXPECT_BPS", "0") or 0)
+    except ValueError:
+        bps = 0.0
+    if bps <= 0:
+        bps = nvenc_target_bps(int(w), int(h), float(fps)) * default_factor
+    return total_dur_s * bps / 8.0 > 0.9 * limit
+
+
+def compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, int]":
+    """(scale_h, maxrate_bps, audio_bps, fps) for the inline Discord copy
+    (`-embed-sm.mp4`). Same plan as the contributor client's compactPlan and
+    the bot's _compact_plan at the 56 MiB node budget: 1080p60 on short plays,
+    720p60 on longer ones, 720p30 only when the budget is genuinely too small."""
+    budget_bits = 56 * 1024 * 1024 * 8
+    dur = float(total_dur_s or 0.0)
+    if dur <= 1:
+        return 1080, 8_000_000, 192_000, 60
+    total_rate = int(budget_bits / dur) or 1
+    pref = 192_000 if dur <= 240 else (128_000 if dur <= 600 else 96_000)
+    audio = min(pref, max(32_000, total_rate // 4))
+    maxrate = max(32_000, min(8_000_000, total_rate - audio))
+    if maxrate >= 3_000_000:
+        return 1080, maxrate, audio, 60
+    if maxrate >= 500_000:
+        return 720, maxrate, audio, 60
+    return 720, maxrate, audio, 30
+
+
+def _preview_sink_args(preview_path) -> list:
+    """Output arguments for the inline preview.
+
+    Default: one faststart mp4 at ``preview_path`` (unchanged).
+
+    LIVE PREVIEW (R3D_PREVIEW_LIVE=1, default OFF): the same encode is written
+    as 2 s self-contained fMP4 segments plus a growing playlist in
+    ``<out stem>.live/`` (init.mp4, seg_00000.m4s ..., live.m3u8), so the
+    contributor client can upload the preview WHILE the render runs and the
+    site can play it before the render is done. No ``.embed.mp4`` is written in
+    this mode; the client stitches one from the segments (a stream copy). A
+    segment is renamed into place only when it is complete, and is listed in
+    the playlist only after that."""
+    if os.environ.get("R3D_PREVIEW_LIVE") != "1":
+        return ["-movflags", "+faststart", str(preview_path)]
+    live_dir = str(preview_path)[:-len(".embed.mp4")] + ".live"
+    os.makedirs(live_dir, exist_ok=True)
+    for _old in os.listdir(live_dir):       # a retry must not show stale segments
+        try:
+            os.remove(os.path.join(live_dir, _old))
+        except OSError:
+            pass
+    return ["-f", "hls", "-hls_time", "2", "-hls_segment_type", "fmp4",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "independent_segments+temp_file",
+            "-hls_fmp4_init_filename", "init.mp4",
+            "-hls_segment_filename", os.path.join(live_dir, "seg_%05d.m4s"),
+            os.path.join(live_dir, "live.m3u8")]
+
+
 def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      output_path: Path, audio_path: Path | None = None,
                      audio_offset_ms: int = 0, video_bitrate: int | None = None,
-                     crf: int = 16, audio_bitrate: str = "192k",
+                     crf: int = 20, audio_bitrate: str = "192k",
                      loudnorm: bool = True, extra_vf: str = "",
                      encoder_device: str | None = None,
                      preview_path: Path | None = None,
                      total_dur_s: float | None = None,
-                     pix_fmt: str = "rgb24") -> list[str]:
+                     pix_fmt: str = "rgb24",
+                     stream_master: bool = False,
+                     compact_path: Path | None = None) -> list[str]:
     """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape).
 
     `preview_path` (INLINE PREVIEW, R3D_PREVIEW_INLINE=1 in the CLI; default
@@ -192,8 +276,15 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # summed peaks without ducking.
         af = ([LOUDNORM] if loudnorm
               else ["alimiter=limit=0.95:level=disabled:attack=1:release=20"])
+        # STREAMABLE MASTER (R3D_STREAM_MASTER=1 in the CLI; default False):
+        # the loudness pass the contributor client would run on the finished
+        # file (loudnorm on the MIXED output) is applied here instead, so
+        # nothing has to rewrite the master after the render.
+        if stream_master and LOUDNORM not in af:
+            af = af + [LOUDNORM]
         acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
                   "-shortest"]
+    _mfast = [] if stream_master else ["-movflags", "+faststart"]
     if preview_path is None:
         cmd += ["-vf", _vf + ("," + _vm_tail if _vm_tail else "")]
         cmd += vc
@@ -201,7 +292,9 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
             if af:
                 cmd += ["-af", ",".join(af)]
             cmd += acodec
-        cmd += ["-movflags", "+faststart", str(output_path)]
+        # stream_master: no +faststart, which rewrites the whole file at close;
+        # the master is then written front to back and the site moves the moov.
+        cmd += _mfast + [str(output_path)]
         if os.environ.get("R3D_STD_NULL_SINK") == "1":
             return _null_sink_cmd()
         return cmd
@@ -217,8 +310,19 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     # otherwise apply before cutting its embed, so the preview needs no
     # post-processing at all.
     pfps = min(30, int(round(float(fps))))
-    graph = [f"[0:v]{_vf},split=2[vm0][vp0];[vm0]{_vm_tail or 'null'}[vm];"
-             f"[vp0]scale=-2:720,fps={pfps}[vp]"]
+    if compact_path is not None:
+        # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1 in the CLI): a third branch
+        # encoded to the compact plan, so nothing is left to encode after the
+        # render. Never upscaled past the master, never above its frame rate.
+        c_h, c_max, c_abps, c_fps = compact_plan(total_dur_s)
+        c_h = min(c_h, int(h))
+        c_fps = min(c_fps, int(round(float(fps))))
+        graph = [f"[0:v]{_vf},split=3[vm0][vp0][vc0];[vm0]{_vm_tail or 'null'}[vm];"
+                 f"[vp0]fps={pfps},scale=-2:720[vp];"
+                 f"[vc0]fps={c_fps},scale=-2:{c_h}:flags=bilinear[vc]"]
+    else:
+        graph = [f"[0:v]{_vf},split=2[vm0][vp0];[vm0]{_vm_tail or 'null'}[vm];"
+                 f"[vp0]fps={pfps},scale=-2:720[vp]"]
     if audio_path is not None:
         # the audio file is input 1 (input 0 is the rawvideo pipe).
         # `aformat=sample_rates=48000` PINS the shared branch to the master's
@@ -231,13 +335,22 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # sits on the preview branch only and the master is byte-identical.
         graph.append(f"[1:a]{','.join(af) or 'anull'},"
                      f"aformat=sample_rates=48000[aout]")
-        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
+        if stream_master:
+            # the shared branch already carries the loudness pass (af above):
+            # master, preview (and Discord copy) get the same normalised audio
+            graph.append("[aout]asplit=3[am][ap][ac]" if compact_path is not None
+                         else "[aout]asplit=2[am][ap]")
+        elif compact_path is not None:
+            # the Discord copy is cut from the FINAL (normalised) audio
+            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM},asplit=2[ap][ac]")
+        else:
+            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
     cmd += ["-filter_complex", ";".join(graph)]
     # output 1: the master, exactly as without the preview
     cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio_path is not None
                                else [])
     cmd += vc + acodec
-    cmd += ["-movflags", "+faststart", str(output_path)]
+    cmd += _mfast + [str(output_path)]
     # output 2: the preview. libx264 on every node, deliberately: a second
     # NVENC/VAAPI session can fail to open (session limits), and one failed
     # output kills the whole process and with it the render.
@@ -250,7 +363,20 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
             "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
     if audio_path is not None:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
-    cmd += ["-movflags", "+faststart", str(preview_path)]
+    cmd += _preview_sink_args(preview_path)
+    if compact_path is not None:
+        # output 3: the Discord copy. Same recipe as the node's own compact
+        # encode (libx264 veryfast crf 21 + VBV at the plan's maxrate).
+        cmd += ["-map", "[vc]"] + (["-map", "[ac]"] if audio_path is not None
+                                   else [])
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-crf", "21", "-maxrate", str(c_max),
+                "-bufsize", str(max(1, c_max // 2)), "-g", str(c_fps),
+                "-threads", str(max(2, min(6, (os.cpu_count() or 4) // 2)))]
+        if audio_path is not None:
+            cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", str(c_abps),
+                    "-shortest"]
+        cmd += _mfast + [str(compact_path)]
     if os.environ.get("R3D_STD_NULL_SINK") == "1":
         return _null_sink_cmd()
     return cmd
