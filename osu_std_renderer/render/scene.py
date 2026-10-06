@@ -142,6 +142,7 @@ from __future__ import annotations
 import bisect
 import math
 import os
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -186,6 +187,17 @@ _ABL_SSAA_NEAREST = perf.envflag("R3D_STD_ABL_SSAA_NEAREST")
 # releases the GIL, so the pool really runs beside the render thread.
 _SSAA_ASYNC = perf.envflag("R3D_STD_SSAA_ASYNC")
 _SSAA_WORKERS = 4
+# R3D_STD_SSAA_GPU: do the whole sub-1080p outro frame on the GPU. The scene
+# behind the card goes framebuffer -> texture by an exact blit instead of a
+# read back to the CPU and a fresh upload (SpriteRenderer.blit_texture_from);
+# the card is composited as before; and Pillow's LANCZOS downscale runs as two
+# integer shader passes (render/ssaa_gpu.py) straight into the output
+# framebuffer. The frame then leaves through the ordinary pipelined readback
+# like any gameplay frame: no hi-res read, no CPU downscale, no futures.
+# Byte-identical by construction (the downscale is integer arithmetic), and
+# checked against Pillow on the live GL context before first use; if that
+# check fails the outro stays on the CPU path.
+_SSAA_GPU = perf.envflag("R3D_STD_SSAA_GPU")
 
 
 def _ssaa_downscale(hi, ow: int, oh: int, yuv: bool):
@@ -2097,6 +2109,12 @@ class StdScene:
             # already holds (oldest first) and the frame queued here comes out on
             # the next call, or in frame_rgb_drain() for the last one. Every frame
             # is emitted exactly once, in order.
+            if self._ssaa_gpu_ready():
+                # an ordinary frame from here on: same ring, same order
+                self._render_ssaa_gpu(t)
+                fr = (self.spr.read_yuv_async() if _GPU_YUV
+                      else self.spr.read_rgb_async())
+                return [fr] if fr is not None else []
             if _SSAA_ASYNC:
                 out = (self.spr.read_yuv_drain() if _GPU_YUV
                        else self.spr.read_drain())
@@ -2128,6 +2146,51 @@ class StdScene:
         self.render_frame(t)
         return self.spr.read_rgb()
 
+    def _ssaa_gpu_ready(self) -> bool:
+        """True when the GPU outro path (R3D_STD_SSAA_GPU) may be used: built
+        once, on the first outro frame, and only kept if its output matched
+        Pillow's on this GL context."""
+        st = getattr(self, "_ssaa_gpu", None)
+        if st is None:
+            st = False
+            if _SSAA_GPU and self.results_ssaa is not None:
+                from .ssaa_gpu import GpuLanczos
+                hi = self.results_ssaa
+                try:
+                    with perf.T("ssaa_gpu_setup"):
+                        g = GpuLanczos(self.spr.ctx, hi.width, hi.height,
+                                       self.spr.width, self.spr.height)
+                        ok = g.self_check()
+                except Exception as e:  # noqa: BLE001 - never fail the render
+                    ok, g = False, None
+                    print(f"ssaa:   GPU downscale unavailable ({e}); "
+                          f"using the CPU path", file=sys.stderr)
+                if ok:
+                    st = g
+                elif g is not None:
+                    print("ssaa:   GPU downscale did not match Pillow on this "
+                          "GL context; using the CPU path", file=sys.stderr)
+            self._ssaa_gpu = st
+        return st is not False
+
+    def _render_ssaa_gpu(self, t: float) -> None:
+        """One results-outro frame, composited at the supersample res and
+        downscaled into self.spr's framebuffer, all on the GPU. Same picture,
+        byte for byte, as _frame_rgb_ssaa (see _SSAA_GPU)."""
+        spr_hi = self.results_ssaa
+        iw, ih = spr_hi.width, spr_hi.height
+        with perf.T("ssaa_base"):
+            self.render_frame(t, skip_results=True)
+            spr_hi.blit_texture_from("_ssaa_base", self.spr)
+        with perf.T("ssaa_card"):
+            spr_hi.begin(clear=(0.0, 0.0, 0.0))
+            spr_hi.draw([Sprite(iw / 2.0, ih / 2.0, float(iw), float(ih),
+                                "_ssaa_base", (1.0, 1.0, 1.0, 1.0))])
+            with perf.T("results_draw"):
+                self.results.draw(t - self.results_start_ms)
+        with perf.T("ssaa_gpu_lanczos"):
+            self._ssaa_gpu.run(spr_hi.color_tex, self.spr.fbo)
+
     def _frame_rgb_ssaa(self, t: float, defer: bool = False):
         """SSAA the results outro: render the scene-behind at OUTPUT res,
         composite the results card on top at the internal supersample res
@@ -2144,6 +2207,10 @@ class StdScene:
         one CPU cost is the final LANCZOS downscale of the supersampled
         composite (the base upscale rides the GPU blit for free)."""
         from PIL import Image
+
+        if not defer and self._ssaa_gpu_ready():
+            self._render_ssaa_gpu(t)
+            return self.spr.read_rgb()
 
         spr_hi = self.results_ssaa
         ow, oh = self.spr.width, self.spr.height

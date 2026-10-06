@@ -92,6 +92,10 @@ _PBO_MARGIN = 3
 _GL_PIXEL_PACK_BUFFER = 0x88EB
 _GL_MAP_READ_BIT = 0x0001
 _GL_MAP_WRITE_BIT = 0x0002
+_GL_READ_FRAMEBUFFER = 0x8CA8
+_GL_DRAW_FRAMEBUFFER = 0x8CA9
+_GL_COLOR_BUFFER_BIT = 0x4000
+_GL_NEAREST = 0x2600
 _gl_c = None
 
 
@@ -119,8 +123,7 @@ def _load_gl_c():
             except OSError:
                 continue
         if lib is None:
-            raise RuntimeError(
-                f"R3D_STD_MAP_READBACK: could not load GL from {names}")
+            raise RuntimeError(f"could not load GL from {names}")
         lib.glBindBuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
         lib.glBindBuffer.restype = None
         lib.glMapBufferRange.argtypes = [ctypes.c_uint, ctypes.c_ssize_t,
@@ -128,6 +131,11 @@ def _load_gl_c():
         lib.glMapBufferRange.restype = ctypes.c_void_p
         lib.glUnmapBuffer.argtypes = [ctypes.c_uint]
         lib.glUnmapBuffer.restype = ctypes.c_ubyte
+        lib.glBindFramebuffer.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        lib.glBindFramebuffer.restype = None
+        lib.glBlitFramebuffer.argtypes = [ctypes.c_int] * 8 + [ctypes.c_uint,
+                                                               ctypes.c_uint]
+        lib.glBlitFramebuffer.restype = None
         _gl_c = lib
     return _gl_c
 _RGB2YUV_SHIFT = 15
@@ -273,6 +281,8 @@ class SpriteRenderer:
         self.fbo = self.ctx.framebuffer(color_attachments=[self.color_tex])
         self._textures: dict[str, "moderngl.Texture"] = {}
         self._nomip_keys: set[str] = set()
+        # key -> (texture, framebuffer over it) for blit_texture_from
+        self._blit_targets: dict = {}
         self._max_tex_cached: int | None = None
         self._warned_big: set = set()
         self._white = self._make_texture_rgba(np.full((1, 1, 4), 255, dtype="u1"))
@@ -410,6 +420,43 @@ class SpriteRenderer:
                 self._textures[key] = tex
                 self._nomip_keys.add(key)
             tex.write(np.ascontiguousarray(rgb), alignment=1)
+
+    def blit_texture_from(self, key: str, src: "SpriteRenderer") -> None:
+        """Make texture `key` hold `src`'s rendered frame, entirely on the GPU.
+
+        Same texels the round trip `write_texture_rgb(key, src.read_rgb())`
+        leaves, without the readback and the upload: a 1:1 NEAREST blit is an
+        exact copy, and its destination rows are flipped because GL keeps a
+        framebuffer's row 0 at the BOTTOM while our textures keep the image's
+        top row first (read_rgb's flipud). Alpha is then forced to 1.0, which
+        is what the 3-component texture sampled. LINEAR, no mips, default
+        wrap: the sampler state write_texture_rgb leaves. Both renderers must
+        share a GL context."""
+        w, h = src.width, src.height
+        ent = self._blit_targets.get(key)
+        if ent is None or ent[0].size != (w, h):
+            old = self._textures.pop(key, None)
+            if old is not None:
+                old.release()
+            if ent is not None:
+                ent[1].release()
+            tex = self.ctx.texture((w, h), 4)
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            ent = (tex, self.ctx.framebuffer(color_attachments=[tex]))
+            self._blit_targets[key] = ent
+            self._textures[key] = tex
+            self._nomip_keys.add(key)
+        tex, fbo = ent
+        g = _load_gl_c()
+        g.glBindFramebuffer(_GL_READ_FRAMEBUFFER, src.fbo.glo)
+        g.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, fbo.glo)
+        g.glBlitFramebuffer(0, 0, w, h, 0, h, w, 0,
+                            _GL_COLOR_BUFFER_BIT, _GL_NEAREST)
+        fbo.color_mask = (False, False, False, True)
+        fbo.clear(0.0, 0.0, 0.0, 1.0)
+        fbo.color_mask = (True, True, True, True)
+        # the raw binds above went behind moderngl's back
+        self.fbo.use()
 
     def has_texture(self, key: str) -> bool:
         return key in self._textures
