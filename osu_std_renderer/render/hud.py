@@ -241,9 +241,11 @@ _HP_CENSUS = perf.envflag("R3D_STD_HP_CENSUS")
 # removing it before building a shader for it.
 _ABL_NOHPBAR = perf.envflag("R3D_STD_ABL_NOHPBAR")
 # Render the Argon bar in a SHADER instead of numpy (parity row 39). Ablation put
-# the ceiling at +12.6%. Not byte-identical: f32 vs f64 at rounding ties, so it is
-# default OFF until that call is made, same class as the chroma decision.
-_HP_GPU = perf.envflag("R3D_STD_HP_GPU")
+# the ceiling at +12.6%. Not byte-identical: f32 vs f64 at rounding ties, which
+# moves about one value in ten million by one level. It is the ONLY default-on
+# speedup that changes any pixel, which is why it is its own commit: ON by
+# default on a Mac like the rest, R3D_STD_HP_GPU=0 for the numpy bar.
+_HP_GPU = perf.envflag("R3D_STD_HP_GPU", perf.FAST_DEFAULT)
 
 _TRACKING = 0.05               # procedural-glyph letter-spacing
 
