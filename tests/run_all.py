@@ -108,6 +108,8 @@ MODULES = [
     # inline preview on the Mac's media engine: the master's arguments never
     # change, the probe decides, a hardware failure switches it off
     "tests.test_preview_hw",
+    # the Metal renderer against the GL one (skips off a Mac)
+    "tests.test_metal",
 ]
 
 
