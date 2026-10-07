@@ -105,6 +105,9 @@ MODULES = [
     "tests.test_multitex",
     # GPU colour conversion == ffmpeg's own, sample for sample
     "tests.test_gpu_yuv",
+    # inline preview on the Mac's media engine: the master's arguments never
+    # change, the probe decides, a hardware failure switches it off
+    "tests.test_preview_hw",
 ]
 
 
