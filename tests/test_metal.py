@@ -204,3 +204,28 @@ def test_nothing_else_is_run_again():
         raise AssertionError("expected KeyboardInterrupt")
     except KeyboardInterrupt:
         pass
+
+
+def test_which_switches_ask_for_metal():
+    """R3D_STD_METAL decides when set; otherwise the node's R3D_METAL does;
+    R3D_STD_STOCK=1 always means OpenGL. Read from the CLI's own source so the
+    rule cannot drift from this table."""
+    import os
+    import subprocess
+    code = ("import sys; from osu_std_renderer.render import perf;"
+            "print(int(bool(perf.envflag('R3D_STD_METAL', perf.envflag('R3D_METAL')) and not perf.STOCK)))")
+    src = open(os.path.join(os.path.dirname(__file__), "..", "osu_std_renderer", "cli.py")).read()
+    assert "perf.envflag(\"R3D_STD_METAL\", perf.envflag(\"R3D_METAL\"))" in src and "not perf.STOCK" in src
+
+    def asked(**env):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("R3D_")}
+        e.update(env)
+        return subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True,
+                              cwd=os.path.join(os.path.dirname(__file__), ".."), check=True).stdout.strip() == "1"
+    assert not asked()
+    assert asked(R3D_STD_METAL="1")
+    assert asked(R3D_METAL="1")                               # the node's switch
+    assert not asked(R3D_METAL="1", R3D_STD_METAL="0")        # std kept on GL by hand
+    assert asked(R3D_METAL="0", R3D_STD_METAL="1")
+    assert not asked(R3D_METAL="1", R3D_STD_STOCK="1")
+    assert not asked(R3D_STD_METAL="1", R3D_STD_STOCK="1")

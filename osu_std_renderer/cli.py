@@ -645,11 +645,15 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     perf.mark("gl_imports_done")
 
     w, h = settings.resolution
-    # R3D_STD_METAL=1 (macOS only, default OFF): draw with the Metal core
-    # instead of OpenGL. Same scene code, same frames to ffmpeg; anything that
-    # goes wrong while setting it up falls back to the GL renderer below.
+    # Metal instead of OpenGL (macOS only). Same scene code, same frames to
+    # ffmpeg; anything that goes wrong while setting it up falls back to the GL
+    # renderer below, and a failure after that re-runs the job on GL
+    # (__main__). Asked for by R3D_STD_METAL=1, or by the node's own Metal
+    # switch R3D_METAL=1 (the one catch acts on); R3D_STD_METAL=0 keeps std on
+    # GL whatever the node says, and so does R3D_STD_STOCK=1.
     metal = False
-    if perf.envflag("R3D_STD_METAL") and sys.platform == "darwin":
+    if (perf.envflag("R3D_STD_METAL", perf.envflag("R3D_METAL"))
+            and not perf.STOCK and sys.platform == "darwin"):
         try:
             from .render.metal.renderer import MetalSpriteRenderer
             from .render.metal.slider_body import MetalSliderBodyRenderer

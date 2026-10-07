@@ -1,13 +1,16 @@
 # render/metal: std on Metal (macOS, Apple Silicon)
 
-`R3D_STD_METAL=1` on a Mac draws the render with Metal instead of OpenGL. The
+On a Mac, `R3D_STD_METAL=1` or the node's own Metal switch `R3D_METAL=1` (the
+one catch acts on) draws the render with Metal instead of OpenGL;
+`R3D_STD_METAL=0` or `R3D_STD_STOCK=1` keeps std on OpenGL whatever the node
+says. The
 scene code is the same; only the renderer underneath changes (`renderer.py`
 stands in for `render/gl.py`'s `SpriteRenderer`, `slider_body.py` for the slider
 body renderer, `ssaa.py` for the results-screen downscale). Frames leave it as
 finished yuv420p, converted on the GPU with the arithmetic `render/gl.py`
 holds equal to ffmpeg's own.
 
-Default OFF. Off, nothing in this directory is imported.
+With neither switch set it is off, and nothing in this directory is imported.
 
 ## What it does not do
 
