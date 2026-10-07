@@ -660,6 +660,7 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
             spr = MetalSpriteRenderer(w, h)
             bodies = MetalSliderBodyRenderer(spr, w, h)
             metal = True
+            perf.METAL_IN_USE = True
             print(f"metal:  {spr.core.device}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 - never fail a render over this
             print(f"metal:  unavailable ({e}); using OpenGL", file=sys.stderr)

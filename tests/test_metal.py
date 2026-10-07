@@ -142,3 +142,65 @@ def test_a_reupload_never_rewrites_the_texture_in_place():
     first = m._tex["k"]
     m.upload_texture("k", a + 1)
     assert m._tex["k"] != first
+
+
+def _main_under(rc=None, raises=None, metal=False):
+    """Run the package's __main__ with the CLI and the re-exec stubbed.
+    Returns (exit code, the environment a re-run was started with or None)."""
+    import os
+    import runpy
+    from osu_std_renderer import cli
+    from osu_std_renderer.render import perf
+    saved = (cli.main, os.execve, perf.METAL_IN_USE)
+    reran = []
+
+    class _Reexec(Exception):
+        pass
+
+    def fake_main():
+        perf.METAL_IN_USE = metal
+        if raises is not None:
+            raise raises
+        return rc
+
+    def fake_execve(exe, argv, env):
+        reran.append((argv, env))
+        raise _Reexec()
+    cli.main, os.execve = fake_main, fake_execve
+    code = None
+    try:
+        try:
+            runpy.run_module("osu_std_renderer", run_name="__main__")
+        except SystemExit as e:
+            code = e.code
+        except _Reexec:
+            code = "re-run"
+    finally:
+        cli.main, os.execve, perf.METAL_IN_USE = saved
+    return code, (reran[0] if reran else None)
+
+
+def test_a_failed_metal_render_is_run_again_on_opengl():
+    code, rerun = _main_under(rc=1, metal=True)
+    assert code == "re-run" and rerun[1]["R3D_STD_METAL"] == "0"
+    assert rerun[0][1:3] == ["-m", "osu_std_renderer"]
+    code, rerun = _main_under(raises=RuntimeError("device lost"), metal=True)
+    assert code == "re-run" and rerun[1]["R3D_STD_METAL"] == "0"
+    code, rerun = _main_under(raises=SystemExit(3), metal=True)
+    assert code == "re-run"
+
+
+def test_nothing_else_is_run_again():
+    assert _main_under(rc=0, metal=True) == (0, None)            # it worked
+    assert _main_under(rc=2, metal=False) == (2, None)           # a GL render failed: its own failure
+    assert _main_under(raises=SystemExit(0), metal=True) == (0, None)
+    try:                                                          # a GL exception is not swallowed
+        _main_under(raises=RuntimeError("x"), metal=False)
+        raise AssertionError("expected the exception")
+    except RuntimeError:
+        pass
+    try:                                                          # a cancelled job is not re-run
+        _main_under(raises=KeyboardInterrupt(), metal=True)
+        raise AssertionError("expected KeyboardInterrupt")
+    except KeyboardInterrupt:
+        pass

@@ -41,6 +41,9 @@ def envflag(name: str, default: bool = False) -> bool:
 # for regression gates ("does stock still equal main?") and for bisecting.
 STOCK = envflag("R3D_STD_STOCK")
 FAST_DEFAULT = sys.platform == "darwin" and not STOCK
+# Set by the CLI once a render is actually drawing with Metal (render/metal):
+# __main__ uses it to re-run a failed Metal render on OpenGL.
+METAL_IN_USE = False
 
 # via envflag, so `R3D_TIMING=0` DISABLES rather than enables (row 42).
 TIMING = envflag("R3D_TIMING")
