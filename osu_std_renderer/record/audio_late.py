@@ -163,6 +163,11 @@ class LateAudio:
         self._wav: "Path | None" = None
         self._err: "BaseException | None" = None
         self._proc: "subprocess.Popen | None" = None
+        # cleanup() and the worker's spawn exclude each other: after a failed
+        # render (which Metal answers by re-running the job in a fresh process)
+        # no audio ffmpeg may be left writing these names
+        self._lock = threading.Lock()
+        self._cancelled = False
         self._thread = threading.Thread(target=self._run, name="std-late-audio",
                                         daemon=True)
         self._t0 = 0.0
@@ -184,9 +189,16 @@ class LateAudio:
                     total_dur_s=self._total_dur_s,
                     preview_lead=self._preview_lead,
                     end_samples=self._end_samples)
-                self._proc = subprocess.Popen(
-                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE)
+                with self._lock:
+                    if self._cancelled:
+                        try:
+                            os.remove(wav)
+                        except OSError:
+                            pass
+                        return
+                    self._proc = subprocess.Popen(
+                        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE)
                 _out, err = self._proc.communicate()
                 if self._proc.returncode != 0:
                     raise RuntimeError(
@@ -223,8 +235,10 @@ class LateAudio:
         return time.monotonic() - t
 
     def cleanup(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.kill()
+        with self._lock:
+            self._cancelled = True
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.kill()
         for p in (self.video_master, self.video_preview, self.video_compact,
                   self._a_master, self._a_preview, self._a_compact, self._wav):
             if p is not None:

@@ -165,6 +165,36 @@ def test_a_failed_mix_is_raised_on_the_render_thread():
         raise AssertionError("finish() swallowed the worker's error")
 
 
+def test_no_audio_process_is_started_after_cleanup():
+    # a render that fails while the song is still being mixed: cleanup() runs
+    # in the `finally`, the worker comes out of the mix afterwards and must
+    # not start ffmpeg on names a re-run of the job is about to write
+    import threading
+    d = tempfile.mkdtemp(prefix="r3d-late-")
+    try:
+        mixing, go = threading.Event(), threading.Event()
+        wav = os.path.join(d, "mix.wav")
+
+        def slow_mix(mark):
+            open(wav, "wb").write(b"not audio")
+            mixing.set()
+            go.wait(5)
+            return wav
+        la = audio_late.LateAudio(output=os.path.join(d, "render_raw.mp4"),
+                                  preview_path=None, compact_path=None,
+                                  mix=slow_mix, total_dur_s=1.0, preview_lead=False)
+        la.start()
+        assert mixing.wait(5)
+        la.cleanup()
+        go.set()
+        la._thread.join(5)
+        assert not la._thread.is_alive()
+        assert la._proc is None and la._err is None
+        assert os.listdir(d) == []          # the mix it finished late is removed too
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _packets(ffmpeg, path, stream):
     out = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-map", f"0:{stream}",
                           "-c", "copy", "-f", "framecrc", "-"],
