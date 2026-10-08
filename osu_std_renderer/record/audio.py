@@ -197,6 +197,28 @@ _MIX_LIMIT = 0.95
 _NOTHING_LUFS = -70.0          # what ebur128 reports when nothing passed its gate
 
 
+_PIN_192K = "aformat=sample_rates=192000"
+
+
+def fixed_gain_chain(rate_filters: str) -> str:
+    """The `-af` chain of the measuring decode: the rate filters, then the
+    measurement where loudnorm stood.
+
+    loudnorm only takes 192 kHz, and with it in the chain ffmpeg resamples to
+    192 kHz BEFORE an `atempo` (DT/HT), so the stock time-stretch runs at
+    192 kHz. Stretched at the file's own rate the song is a different (equally
+    valid) stretch: another length by a few ms and not sample-aligned with
+    stock's. Pinning the same rate at the same place keeps the stretch exactly
+    stock's, so the only thing the switch changes is the loudness. Measured:
+    with the pin the 1.5x and 0.75x songs match stock's length to the sample
+    and correlate 0.999+ at lag 0; without it 0.2-0.35. Chains without atempo
+    come out the same either way, so they skip the pin and its cost."""
+    parts = [rate_filters] if rate_filters else []
+    if "atempo" in rate_filters:
+        parts.append(_PIN_192K)
+    return ",".join(parts + [_EBUR128])
+
+
 def parse_integrated_lufs(stderr_text: str) -> "float | None":
     """The integrated loudness out of ffmpeg's `ebur128` summary. None when
     there is no summary to read (the caller then keeps the stock filter);
@@ -323,7 +345,7 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
         # as it was decoded. `info` is the level ebur128 prints its summary at.
         cmd = [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info",
                "-i", str(path)]
-        af = (af + "," if af else "") + _EBUR128
+        af = fixed_gain_chain(af)
     elif loudnorm:
         # LOUDNORM DUCK FIX (#17): normalise the MUSIC ALONE here (music-only,
         # no hit transients) so the encode does NOT loudnorm the song+hits mix

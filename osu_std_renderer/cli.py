@@ -701,8 +701,11 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # audio in the encode) the loudness is measured and one gain is applied
     # instead: 0.75 s against 17.6 s for a 482 s song this node has not
     # rendered before. It is a different sound (the track's own dynamics are
-    # kept), which is why it is a switch. See record/audio.py.
-    fixed_gain = perf.envflag("R3D_STD_FIXED_GAIN") and not perf.STOCK
+    # kept), which is why it is a switch. See record/audio.py. The node-wide
+    # R3D_FIXED_GAIN=1 turns it on in every engine; std's own switch wins.
+    fixed_gain = (perf.envflag("R3D_STD_FIXED_GAIN",
+                               perf.envflag("R3D_FIXED_GAIN"))
+                  and not perf.STOCK)
     _audio_afile = beatmap.get_audio_file(beatmap_dir)
     _audio_fut = None
     if _audio_afile is not None and not args.dump_frames:

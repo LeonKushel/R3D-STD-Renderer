@@ -221,6 +221,66 @@ def test_real_decode_lands_on_the_target_with_one_gain():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _noise(path, seconds, level=0.25, rate=48000, seed=7):
+    """Steady band-limited noise: nothing periodic, so two time-stretches of it
+    only line up if they are the same stretch."""
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(int(seconds * rate))
+    x = np.convolve(x, np.ones(8) / 8.0, mode="same") * level * 2.0
+    data = np.repeat(x[:, None], 2, axis=1).astype("<f4").tobytes()
+    with open(path, "wb") as fh:
+        fh.write(b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt ")
+        fh.write(struct.pack("<IHHIIHH", 16, 3, 2, rate, rate * 8, 8, 32))
+        fh.write(b"data" + struct.pack("<I", len(data)) + data)
+    return Path(path)
+
+
+def _as_aac(wav):
+    """The same sound as an .m4a. Songs are mp3 or ogg, whose decoders hand
+    ffmpeg PLANAR samples; that is the case in which the stock chain stretches
+    at 192 kHz (a float wav does not trigger it). AAC decodes planar too, and
+    every ffmpeg can encode it."""
+    out = Path(str(wav)[:-4] + ".m4a")
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i",
+                    str(wav), "-c:a", "aac", "-b:a", "192k", str(out)], check=True)
+    return out
+
+
+def _corr0(a, b):
+    """Correlation at lag 0 of two equally long signals."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    return float((a * b).sum() / math.sqrt((a * a).sum() * (b * b).sum()))
+
+
+def test_a_speed_changed_song_is_stretched_exactly_as_stock():
+    # where the chain is pinned to loudnorm's rate, and where it is not
+    eb = "ebur128=framelog=quiet"
+    assert audio.fixed_gain_chain("") == eb
+    assert audio.fixed_gain_chain("atempo=1.5") == \
+        "atempo=1.5,aformat=sample_rates=192000," + eb
+    for rate, pitch in ((1.5, False), (0.75, False), (1.5, True), (1.3, True)):
+        af = audio.rate_audio_filter(rate, pitch)
+        want = af + (",aformat=sample_rates=192000" if "atempo" in af else "") + "," + eb
+        assert audio.fixed_gain_chain(af) == want
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return
+    d = tempfile.mkdtemp(prefix="r3d-gain-")
+    restore = _with_cache(Path(d) / "cache")
+    try:
+        src = _as_aac(_noise(Path(d) / "noise.wav", 6.0))
+        for rate in (1.5, 0.75):
+            stock = audio.decode_to_pcm(src, rate=rate, loudnorm=True)
+            fixed = audio.decode_to_pcm(src, rate=rate, loudnorm=True, fixed_gain=True)
+            # the same stretch: the same length to the sample, and lined up
+            assert fixed.shape == stock.shape, (rate, fixed.shape, stock.shape)
+            assert _corr0(fixed, stock) >= 0.97, (rate, _corr0(fixed, stock))
+    finally:
+        restore()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_real_mix_gain_is_the_distance_to_the_target():
     ff = shutil.which("ffmpeg")
     if not ff:
